@@ -1,6 +1,14 @@
 /.idea
 /.vscode
-/vendor
 *.log
 .env
-composer.lock
+/node_modules/
+/test-results/
+/playwright-report/
+__pycache__/
+*.credentials.json
+/.env.node
+/data/
+/dist/
+/coverage/
+*.zip

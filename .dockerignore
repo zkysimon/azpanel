@@ -1,0 +1,10 @@
+.git
+.env
+.env.node
+*.credentials.json
+node_modules
+data
+dist
+test-results
+playwright-report
+*.log

@@ -1,0 +1,16 @@
+services:
+  azpanel:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env.node
+    environment:
+      HOST: 0.0.0.0
+      DATA_DIR: /app/data
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - azpanel-data:/app/data
+    stop_grace_period: 12m
+volumes:
+  azpanel-data:
