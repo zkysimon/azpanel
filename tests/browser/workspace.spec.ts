@@ -83,6 +83,17 @@ test("login, navigation, MD3 theme, resource details, quota and mobile layout", 
   await expect(
     page.getByText("当前为只读模式。", { exact: false }),
   ).toBeVisible();
+  // Region and image lists are fetched live from the account instead of typed by hand.
+  const region = page.getByLabel("区域");
+  await expect(region).toBeEnabled();
+  await region.click();
+  await page.getByRole("option", { name: /East Asia/ }).click();
+  const image = page.getByLabel("系统镜像");
+  await expect(image).toBeEnabled();
+  await image.click();
+  await page
+    .getByRole("option", { name: /Ubuntu 24\.04 LTS · server/ })
+    .click();
   await page.getByRole("button", { name: "加载可用规格" }).click();
   await expect(page.getByLabel("虚拟机规格")).toContainText("B1s");
   await expect(

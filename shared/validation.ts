@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { imageRefSchema, looksLikeWindows } from "./images.js";
 
 export const credentialsSchema = z.object({
   appId: z.string().uuid(),
@@ -20,7 +21,7 @@ export const createVmSchema = z
     name: vmNameSchema,
     location: regionSchema,
     size: sizeSchema,
-    image: z.enum(["ubuntu-24", "ubuntu-22", "debian-12", "windows-2022"]),
+    image: imageRefSchema,
     diskSize: z.number().int().min(30).max(4095),
     username: z
       .string()
@@ -73,7 +74,7 @@ export const createVmSchema = z
         ).length < 3)
     )
       error("password", "密码至少 12 位，包含大小写、数字、符号中的三类");
-    if (value.image === "windows-2022") {
+    if (looksLikeWindows(value.image)) {
       if (value.authentication !== "password")
         error("authentication", "Windows 需要密码认证");
       if (value.name.length > 15) error("name", "Windows 主机名称最多 15 位");

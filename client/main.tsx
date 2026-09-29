@@ -75,6 +75,7 @@ import type {
   Account,
   Audit,
   Json,
+  Location,
   MetricPoint,
   Overview,
   Session,
@@ -84,6 +85,11 @@ import type {
   VirtualMachine,
 } from "../shared/types.js";
 import type { CreateVm } from "../shared/validation.js";
+import {
+  fallbackImages,
+  looksLikeWindows,
+  type ImageOption,
+} from "../shared/images.js";
 import { api, setCsrf } from "./api.js";
 import { makeTheme } from "./theme.js";
 import "./styles.css";
@@ -1181,13 +1187,19 @@ function CreatePage({ session, notify, navigate }: PageProps) {
   const { data: accounts } = useLoad(() => api<Account[]>("/accounts"), []);
   const [accountId, setAccountId] = useState(""),
     [skus, setSkus] = useState<Sku[]>([]),
-    [error, setError] = useState(""),
-    [busy, setBusy] = useState(false);
+    [locations, setLocations] = useState<Location[]>([]),
+    [images, setImages] = useState<ImageOption[]>(fallbackImages),
+    [locationsError, setLocationsError] = useState(""),
+    [imagesError, setImagesError] = useState(""),
+    [loadingLocations, setLoadingLocations] = useState(false),
+    [loadingImages, setLoadingImages] = useState(false),
+    [loadingSkus, setLoadingSkus] = useState(false),
+    [error, setError] = useState("");
   const [form, setForm] = useState<CreateVm>({
     name: "",
-    location: "eastus",
+    location: "",
     size: "Standard_B1s",
-    image: "ubuntu-24",
+    image: fallbackImages[0],
     diskSize: 30,
     username: "azureuser",
     authentication: "ssh",
@@ -1198,16 +1210,72 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     customData: "",
     confirmation: "",
   });
+  const busy = loadingLocations || loadingImages || loadingSkus;
   const field = <K extends keyof CreateVm>(key: K, value: CreateVm[K]) =>
     setForm((old) => ({ ...old, [key]: value }));
+  const imageValue = (option: {
+    publisher: string;
+    offer: string;
+    sku: string;
+  }) => `${option.publisher}|${option.offer}|${option.sku}`;
+  const windows = looksLikeWindows(form.image);
   useEffect(() => {
     if (!accountId && accounts?.length)
       setAccountId(
         accounts.find((account) => account.state === "Enabled")?.id ?? "",
       );
   }, [accounts]);
+  // Regions come from the subscription itself instead of a hard-coded list.
+  useEffect(() => {
+    if (!accountId) return;
+    let current = true;
+    setLoadingLocations(true);
+    setLocationsError("");
+    setLocations([]);
+    api<Location[]>(`/accounts/${accountId}/locations`)
+      .then((list) => {
+        if (!current) return;
+        setLocations(list);
+        if (!list.some((location) => location.name === form.location))
+          field("location", list[0]?.name ?? "");
+      })
+      .catch((e) => current && setLocationsError((e as Error).message))
+      .finally(() => current && setLoadingLocations(false));
+    return () => {
+      current = false;
+    };
+  }, [accountId]);
+  // Images are discovered live per region (server caches them 24h).
+  useEffect(() => {
+    if (!accountId || !form.location) return;
+    let current = true;
+    setLoadingImages(true);
+    setImagesError("");
+    api<ImageOption[]>(
+      `/accounts/${accountId}/images?region=${encodeURIComponent(form.location)}`,
+    )
+      .then((list) => {
+        if (!current || !list.length) return;
+        setImages(list);
+        const keep = list.find(
+          (option) => imageValue(option) === imageValue(form.image),
+        );
+        const chosen = keep ?? list[0];
+        field("image", chosen);
+        if (looksLikeWindows(chosen)) field("authentication", "password");
+      })
+      .catch((e) => current && setImagesError((e as Error).message))
+      .finally(() => current && setLoadingImages(false));
+    return () => {
+      current = false;
+    };
+  }, [accountId, form.location]);
+  // Switching region or account invalidates previously loaded sizes.
+  useEffect(() => {
+    setSkus([]);
+  }, [accountId, form.location]);
   async function loadSkus() {
-    setBusy(true);
+    setLoadingSkus(true);
     setError("");
     try {
       setSkus(
@@ -1218,13 +1286,13 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     } catch (e) {
       setError((e as Error).message);
     } finally {
-      setBusy(false);
+      setLoadingSkus(false);
     }
   }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    setBusy(true);
     setError("");
+    setLoadingSkus(true);
     try {
       await api(`/accounts/${accountId}/machines`, "POST", form);
       notify("创建任务已提交。请到任务中心查看进度。");
@@ -1232,7 +1300,7 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     } catch (e) {
       setError((e as Error).message);
     } finally {
-      setBusy(false);
+      setLoadingSkus(false);
     }
   }
   return (
@@ -1281,33 +1349,55 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                   helperText="以字母开头，可使用字母、数字和连字符"
                 />
                 <TextField
+                  select
                   label="区域"
                   required
                   value={form.location}
-                  onChange={(e) => {
-                    field("location", e.target.value);
-                    setSkus([]);
-                  }}
-                  helperText="Azure 区域代码，例如 eastus / japaneast"
-                />
+                  onChange={(e) => field("location", e.target.value)}
+                  disabled={loadingLocations || !locations.length}
+                  helperText={
+                    locationsError ||
+                    (loadingLocations
+                      ? "正在从 Azure 读取可用区域…"
+                      : "来自当前订阅的可用区域")
+                  }
+                >
+                  <MenuItem value="" disabled>
+                    {loadingLocations ? "读取中…" : "请选择区域"}
+                  </MenuItem>
+                  {locations.map((location) => (
+                    <MenuItem key={location.name} value={location.name}>
+                      {location.displayName} · {location.name}
+                    </MenuItem>
+                  ))}
+                </TextField>
                 <TextField
                   select
                   label="系统镜像"
-                  value={form.image}
+                  value={imageValue(form.image)}
+                  disabled={loadingImages || !images.length}
                   onChange={(e) => {
-                    field("image", e.target.value as CreateVm["image"]);
-                    if (e.target.value === "windows-2022")
+                    const option = images.find(
+                      (item) => imageValue(item) === e.target.value,
+                    );
+                    if (!option) return;
+                    field("image", option);
+                    if (looksLikeWindows(option))
                       field("authentication", "password");
                   }}
+                  helperText={
+                    imagesError ||
+                    (loadingImages
+                      ? "正在从 Azure 读取该区域镜像…"
+                      : "来自 Azure 的镜像目录，结果缓存 24 小时")
+                  }
                 >
-                  {[
-                    ["ubuntu-24", "Ubuntu 24.04 LTS"],
-                    ["ubuntu-22", "Ubuntu 22.04 LTS"],
-                    ["debian-12", "Debian 12"],
-                    ["windows-2022", "Windows Server 2022"],
-                  ].map(([value, label]) => (
-                    <MenuItem key={value} value={value}>
-                      {label} · Gen2
+                  {images.map((option) => (
+                    <MenuItem
+                      key={imageValue(option)}
+                      value={imageValue(option)}
+                    >
+                      {option.label} · {option.osType}
                     </MenuItem>
                   ))}
                 </TextField>
@@ -1392,10 +1482,7 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                     )
                   }
                 >
-                  <MenuItem
-                    value="ssh"
-                    disabled={form.image === "windows-2022"}
-                  >
+                  <MenuItem value="ssh" disabled={windows}>
                     SSH 公钥
                   </MenuItem>
                   <MenuItem value="password">密码</MenuItem>
@@ -1446,7 +1533,7 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                     minRows={3}
                     value={form.customData}
                     onChange={(e) => field("customData", e.target.value)}
-                    disabled={form.image === "windows-2022"}
+                    disabled={windows}
                   />
                 </div>
               </div>
@@ -1469,6 +1556,10 @@ function CreatePage({ session, notify, navigate }: PageProps) {
               <div className="summary-row">
                 <span>规格</span>
                 <b>{form.size.replace("Standard_", "")}</b>
+              </div>
+              <div className="summary-row">
+                <span>系统镜像</span>
+                <b>{form.image.sku}</b>
               </div>
               <div className="summary-row">
                 <span>系统盘</span>
@@ -1523,7 +1614,8 @@ function ExplorePage({
 }: PageProps & { mode: "resources" | "quota" }) {
   const { data: accounts } = useLoad(() => api<Account[]>("/accounts"), []);
   const [account, setAccount] = useState(""),
-    [region, setRegion] = useState("eastus"),
+    [region, setRegion] = useState(""),
+    [regions, setRegions] = useState<Location[]>([]),
     [data, setData] = useState<Json[] | null>(null),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
@@ -1535,6 +1627,22 @@ function ExplorePage({
     setData(null);
     setItems(null);
   }, [account, region, mode]);
+  // Region list comes from the selected account.
+  useEffect(() => {
+    if (!account) return;
+    let current = true;
+    api<Location[]>(`/accounts/${account}/locations`)
+      .then((list) => {
+        if (!current) return;
+        setRegions(list);
+        if (!list.some((location) => location.name === region))
+          setRegion(list[0]?.name ?? "");
+      })
+      .catch(() => current && setRegions([]));
+    return () => {
+      current = false;
+    };
+  }, [account]);
   async function load() {
     setBusy(true);
     setError("");
@@ -1582,10 +1690,18 @@ function ExplorePage({
         </TextField>
         {mode === "quota" && (
           <TextField
-            label="区域代码"
+            select
+            label="区域"
             value={region}
             onChange={(e) => setRegion(e.target.value)}
-          />
+            disabled={!regions.length}
+          >
+            {regions.map((location) => (
+              <MenuItem key={location.name} value={location.name}>
+                {location.displayName} · {location.name}
+              </MenuItem>
+            ))}
+          </TextField>
         )}
         <Button
           variant="contained"

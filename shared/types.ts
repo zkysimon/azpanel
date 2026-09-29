@@ -78,6 +78,12 @@ export interface Sku {
   architecture: string;
   restricted: boolean;
 }
+export interface Location {
+  name: string;
+  displayName: string;
+  regionalDisplayName: string;
+  geography: string;
+}
 export interface Quota {
   name: string;
   label: string;

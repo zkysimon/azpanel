@@ -40,6 +40,17 @@ const azure = new Azure(
           },
         ],
       });
+    if (String(url).includes("/locations?"))
+      return Response.json({
+        value: [
+          { name: "eastasia", displayName: "East Asia", metadata: {} },
+          { name: "japaneast", displayName: "Japan East", metadata: {} },
+        ],
+      });
+    if (String(url).includes("/artifacttypes/vmimage/offers/"))
+      return Response.json({
+        value: [{ name: "server" }, { name: "gen1" }],
+      });
     if (String(url).includes("/skus?"))
       return Response.json({
         value: [

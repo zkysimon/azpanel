@@ -11,6 +11,13 @@ import type {
   VirtualMachine,
 } from "../shared/types.js";
 import type { CreateVm } from "../shared/validation.js";
+import {
+  imageTargets,
+  looksLikeWindows,
+  selectGen2Skus,
+  type ImageOption,
+  type ImageRef,
+} from "../shared/images.js";
 import { AppError } from "./store.js";
 
 const ARM = "https://management.azure.com";
@@ -334,12 +341,90 @@ export class Azure {
     return promise;
   }
   async locations(credentials: Credentials, account: Account) {
-    return this.cached(`locations:${account.id}`, 3600000, () =>
-      this.list(
+    return this.cached(`locations:${account.id}`, 3600000, async () => {
+      const data = await this.list(
         credentials,
         `/subscriptions/${account.subscriptionId}/locations?api-version=2022-12-01`,
-      ),
-    );
+      );
+      return data
+        .filter((location) => location.name && location.displayName)
+        .map((location) => ({
+          name: String(location.name),
+          displayName: String(location.displayName),
+          regionalDisplayName: String(
+            location.regionalDisplayName ?? location.displayName,
+          ),
+          geography: String(location.metadata?.geography ?? ""),
+        }))
+        .sort((a, b) => a.displayName.localeCompare(b.displayName, "en"));
+    });
+  }
+  /** Reads each curated offer's SKUs live from Azure. Cached 24h per account+region. */
+  async imageOptions(
+    credentials: Credentials,
+    account: Account,
+    region: string,
+  ): Promise<ImageOption[]> {
+    return this.cached(`images:${account.id}:${region}`, 86400000, async () => {
+      const base = `/subscriptions/${account.subscriptionId}/providers/Microsoft.Compute/locations/${region}/publishers`;
+      const options: ImageOption[] = [];
+      for (const target of imageTargets) {
+        try {
+          const skus = await this.list(
+            credentials,
+            `${base}/${target.publisher}/artifacttypes/vmimage/offers/${target.offer}/skus?api-version=2024-11-01`,
+          );
+          for (const sku of selectGen2Skus(
+            skus.map((item) => String(item.name)),
+          )) {
+            const label = `${target.family} · ${sku}`;
+            options.push({
+              publisher: target.publisher,
+              offer: target.offer,
+              sku,
+              version: "latest",
+              label,
+              family: target.family,
+              osType: looksLikeWindows({
+                publisher: target.publisher,
+                offer: target.offer,
+                sku,
+              })
+                ? "Windows"
+                : "Linux",
+            });
+          }
+        } catch (error) {
+          // A publisher absent from a region is expected; skip it but surface auth failures.
+          if (error instanceof AzureError && error.azureStatus === 404)
+            continue;
+          throw error;
+        }
+      }
+      return options.sort(
+        (a, b) =>
+          a.family.localeCompare(b.family) || a.sku.localeCompare(b.sku),
+      );
+    });
+  }
+  /** Confirms the selected publisher/offer/sku exists in the region before deploying. */
+  async assertImageAvailable(
+    credentials: Credentials,
+    account: Account,
+    region: string,
+    image: ImageRef,
+  ) {
+    const path = `/subscriptions/${account.subscriptionId}/providers/Microsoft.Compute/locations/${region}/publishers/${image.publisher}/artifacttypes/vmimage/offers/${image.offer}/skus/${image.sku}`;
+    try {
+      await this.request(credentials, "GET", `${path}?api-version=2024-11-01`);
+    } catch (error) {
+      if (error instanceof AzureError && error.azureStatus === 404)
+        throw new AppError(
+          422,
+          `所选镜像 ${image.offer}/${image.sku} 在区域 ${region} 不可用，请更换镜像或区域`,
+        );
+      throw error;
+    }
   }
   async skus(
     credentials: Credentials,
@@ -528,6 +613,13 @@ export class Azure {
       throw new AppError(422, "所选规格不可用或架构不兼容");
     if (!sku.generations.includes("V2"))
       throw new AppError(422, "当前镜像需要支持 Gen2 的规格");
+    progress("确认所选镜像在目标区域可用");
+    await this.assertImageAvailable(
+      credentials,
+      account,
+      input.location,
+      input.image,
+    );
     const root = `/subscriptions/${account.subscriptionId}/resourceGroups/${input.name}-azpanel`;
     const groups = await this.groups(credentials, account);
     if (
@@ -691,23 +783,12 @@ export class Azure {
 export function deploymentTemplate(input: CreateVm) {
   const name = input.name;
   const image = {
-    "ubuntu-24": {
-      publisher: "Canonical",
-      offer: "ubuntu-24_04-lts",
-      sku: "server",
-    },
-    "ubuntu-22": {
-      publisher: "Canonical",
-      offer: "0001-com-ubuntu-server-jammy",
-      sku: "22_04-lts-gen2",
-    },
-    "debian-12": { publisher: "Debian", offer: "debian-12", sku: "12-gen2" },
-    "windows-2022": {
-      publisher: "MicrosoftWindowsServer",
-      offer: "WindowsServer",
-      sku: "2022-datacenter-smalldisk-g2",
-    },
-  }[input.image];
+    publisher: input.image.publisher,
+    offer: input.image.offer,
+    sku: input.image.sku,
+    version: input.image.version || "latest",
+  };
+  const windows = looksLikeWindows(input.image);
   const id = (type: string, suffix: string) =>
     `[resourceId('${type}', '${name}-${suffix}')]`;
   const nsg = id("Microsoft.Network/networkSecurityGroups", "nsg");
@@ -734,8 +815,7 @@ export function deploymentTemplate(input: CreateVm) {
               sourceAddressPrefix: input.allowedSource,
               sourcePortRange: "*",
               destinationAddressPrefix: "*",
-              destinationPortRange:
-                input.image === "windows-2022" ? "3389" : "22",
+              destinationPortRange: windows ? "3389" : "22",
             },
           },
         ],

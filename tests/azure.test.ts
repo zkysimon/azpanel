@@ -10,6 +10,7 @@ import {
   selectSubscription,
 } from "../server/azure.js";
 import { createVmSchema } from "../shared/validation.js";
+import { selectGen2Skus } from "../shared/images.js";
 import {
   encrypt,
   decrypt,
@@ -148,7 +149,12 @@ test("deployment uses static Standard IPs, explicit dependencies, restricted ing
     confirmation: "test-vm",
     location: "eastus",
     size: "Standard_B1s",
-    image: "ubuntu-24",
+    image: {
+      publisher: "Canonical",
+      offer: "ubuntu-24_04-lts",
+      sku: "server",
+      version: "latest",
+    },
     diskSize: 30,
     username: "azureuser",
     authentication: "password",
@@ -198,6 +204,60 @@ test("deployment uses static Standard IPs, explicit dependencies, restricted ing
     createVmSchema.parse({ ...input, allowedSource: "999.1.1.1/999" }),
   );
 });
+test("SKU filter keeps Gen2 x64 images and drops Gen1/arm64", () => {
+  assert.deepEqual(selectGen2Skus(["server", "server-gen1", "minimal-arm64"]), [
+    "server",
+  ]);
+  assert.deepEqual(selectGen2Skus(["22_04-lts", "22_04-lts-gen2"]), [
+    "22_04-lts-gen2",
+  ]);
+  assert.deepEqual(
+    selectGen2Skus(["2022-datacenter-g2", "2019-datacenter-g2"]),
+    ["2022-datacenter-g2", "2019-datacenter-g2"],
+  );
+});
+
+test("image listing reads SKUs live from Azure and skips regions without a publisher", async () => {
+  const requested: string[] = [];
+  const azure = new Azure(
+    new RequestGate(0),
+    async (url) => {
+      requested.push(String(url));
+      if (String(url).includes("debian-12"))
+        return response({
+          value: [{ name: "12-gen2" }, { name: "12-gen1" }],
+        });
+      if (String(url).includes("WindowsServer"))
+        return response({
+          value: [{ name: "2022-datacenter-smalldisk-g2" }],
+        });
+      return response({ error: { code: "NotFound" } }, 404);
+    },
+    async () => "token",
+  );
+  const { account } = await import("./fixtures.js");
+  const options = await azure.imageOptions(credentials, account, "eastus");
+  assert.ok(
+    options.every((option) => !/gen1|arm64/i.test(option.sku)),
+    "Gen1/arm64 SKUs must be filtered out",
+  );
+  assert.deepEqual(
+    options.map((option) => option.label),
+    ["Debian 12 · 12-gen2", "Windows Server · 2022-datacenter-smalldisk-g2"],
+  );
+  assert.equal(
+    options.find((option) => option.family === "Windows Server")?.osType,
+    "Windows",
+  );
+  assert.equal(
+    options.find((option) => option.family === "Debian 12")?.osType,
+    "Linux",
+  );
+  const requestsBefore = requested.length;
+  await azure.imageOptions(credentials, account, "eastus");
+  assert.equal(requested.length, requestsBefore, "second call must hit cache");
+});
+
 test("request gate serializes concurrent requests", async () => {
   const gate = new RequestGate(10),
     order: string[] = [];

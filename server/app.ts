@@ -17,6 +17,7 @@ import { AppError, Store } from "./store.js";
 import { hashPassword, hashToken, verifyPassword } from "./security.js";
 import type { Config } from "./config.js";
 import { Azure, RequestGate, selectSubscription } from "./azure.js";
+import { fallbackImages } from "../shared/images.js";
 import { Tasks } from "./tasks.js";
 
 declare module "fastify" {
@@ -330,6 +331,16 @@ export async function buildApp(
   app.get("/api/accounts/:id/locations", async (request) => {
     const { account, credentials } = accountContext(request);
     return azure.locations(credentials, account);
+  });
+  app.get("/api/accounts/:id/images", async (request) => {
+    const { account, credentials } = accountContext(request);
+    const { region } = z.object({ region: regionSchema }).parse(request.query);
+    try {
+      return await azure.imageOptions(credentials, account, region);
+    } catch {
+      // Fall back to the curated defaults so the page still works offline.
+      return fallbackImages;
+    }
   });
   app.get("/api/accounts/:id/skus", async (request) => {
     const { account, credentials } = accountContext(request);

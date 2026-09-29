@@ -46,7 +46,12 @@ test("creation checks availability and group collision before submitting depende
     confirmation: "test-vm",
     location: "eastus",
     size: "Standard_B1s",
-    image: "ubuntu-24",
+    image: {
+      publisher: "Canonical",
+      offer: "ubuntu-24_04-lts",
+      sku: "server",
+      version: "latest",
+    },
     diskSize: 30,
     username: "azureuser",
     authentication: "password",
