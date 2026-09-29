@@ -55,6 +55,14 @@ export interface User {
   id: string;
   email: string;
   role: "admin" | "user";
+  avatarUrl?: string | null;
+}
+/** Admin view of a member, including status and usage counts. */
+export interface ManagedUser extends User {
+  disabled: boolean;
+  createdAt: number;
+  accounts: number;
+  machines: number;
 }
 export interface Session {
   user: User | null;

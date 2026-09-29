@@ -530,3 +530,206 @@ test("invite registration enforces expiry, use limits, and admin control", async
     await app.close();
   }
 });
+
+test("admin manages members: email, role, disable, password reset, delete", async () => {
+  const store = new Store(testConfig, true);
+  const { app } = await buildApp(testConfig, {
+    store,
+    azure: new Azure(
+      new RequestGate(0),
+      async () => Response.json({ value: [] }),
+      async () => "token",
+    ),
+  });
+  try {
+    const adminLogin = await app.inject({
+      method: "POST",
+      url: "/api/login",
+      payload: {
+        email: testConfig.adminEmail,
+        password: testConfig.adminPassword,
+      },
+    });
+    const headers = {
+      cookie: "azpanel_session=" + adminLogin.cookies[0].value,
+      "x-csrf-token": adminLogin.json().csrf,
+    };
+    const member = store.createUser("managed@example.test", "ManagedPass-1234");
+    const listed = (await app.inject({ url: "/api/users", headers })).json();
+    const target = listed.find((item: { id: string }) => item.id === member.id);
+    assert.equal(target.disabled, false);
+    assert.equal(target.accounts, 0);
+    assert.equal(target.machines, 0);
+    assert.match(target.avatarUrl, /gravatar\.com\/avatar\/[a-f0-9]{64}/);
+    // Change email and role; the member's session must be invalidated.
+    const memberLogin = await app.inject({
+      method: "POST",
+      url: "/api/login",
+      payload: { email: member.email, password: "ManagedPass-1234" },
+    });
+    const memberCookie = "azpanel_session=" + memberLogin.cookies[0].value;
+    assert.equal(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/users/${member.id}`,
+          headers,
+          payload: { email: "renamed@example.test", role: "admin" },
+        })
+      ).statusCode,
+      200,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          url: "/api/accounts",
+          headers: { cookie: memberCookie },
+        })
+      ).statusCode,
+      401,
+    );
+    // Disable blocks login and existing sessions.
+    const disabled = await app.inject({
+      method: "PATCH",
+      url: `/api/users/${member.id}`,
+      headers,
+      payload: { disabled: true },
+    });
+    assert.equal(disabled.json().disabled, true);
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/login",
+          payload: {
+            email: "renamed@example.test",
+            password: "ManagedPass-1234",
+          },
+        })
+      ).statusCode,
+      403,
+    );
+    // Re-enable and reset the password.
+    await app.inject({
+      method: "PATCH",
+      url: `/api/users/${member.id}`,
+      headers,
+      payload: { disabled: false },
+    });
+    assert.equal(
+      (
+        await app.inject({
+          method: "PUT",
+          url: `/api/users/${member.id}/password`,
+          headers,
+          payload: { password: "ResetPassword-1234" },
+        })
+      ).statusCode,
+      200,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/login",
+          payload: {
+            email: "renamed@example.test",
+            password: "ManagedPass-1234",
+          },
+        })
+      ).statusCode,
+      401,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/login",
+          payload: {
+            email: "renamed@example.test",
+            password: "ResetPassword-1234",
+          },
+        })
+      ).statusCode,
+      200,
+    );
+    // Guard rails: cannot delete or demote the last admin, nor delete self.
+    const adminId = adminLogin.json().user.id;
+    // Demote the promoted member again so only one admin remains.
+    assert.equal(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/users/${member.id}`,
+          headers,
+          payload: { role: "user" },
+        })
+      ).statusCode,
+      200,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/users/${adminId}`,
+          headers,
+        })
+      ).statusCode,
+      422,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/users/${adminId}`,
+          headers,
+          payload: { role: "user" },
+        })
+      ).statusCode,
+      422,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/users/${adminId}`,
+          headers,
+          payload: { disabled: true },
+        })
+      ).statusCode,
+      422,
+    );
+    // Duplicate email is rejected; deleting a member works.
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/users",
+          headers,
+          payload: {
+            email: "renamed@example.test",
+            password: "AnotherPass-1234",
+            role: "user",
+          },
+        })
+      ).statusCode,
+      409,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/users/${member.id}`,
+          headers,
+        })
+      ).statusCode,
+      200,
+    );
+    assert.equal(
+      (await app.inject({ url: "/api/users", headers })).json().length,
+      1,
+    );
+  } finally {
+    await app.close();
+  }
+});

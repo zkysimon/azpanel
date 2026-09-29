@@ -122,7 +122,9 @@ test("login, navigation, MD3 theme, resource details, quota and mobile layout", 
     .locator("nav")
     .getByRole("button", { name: "设置", exact: true })
     .click();
-  await expect(page.getByText("工作空间成员", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: /工作空间成员/ }),
+  ).toBeVisible();
   await page.getByRole("button", { name: "添加成员" }).click();
   await page.getByLabel("邮箱", { exact: true }).fill("member@example.test");
   await page.getByLabel("初始密码（至少 12 位）").fill("Test-member-password");
@@ -130,6 +132,44 @@ test("login, navigation, MD3 theme, resource details, quota and mobile layout", 
   await expect(
     page.getByText("member@example.test", { exact: true }),
   ).toBeVisible();
+  // Manage the member: edit, disable, reset password, then delete.
+  const memberRow = page
+    .locator(".resource-line")
+    .filter({ hasText: "member@example.test" });
+  await memberRow.getByRole("button", { name: "停用用户" }).click();
+  await expect(memberRow.getByText("已停用")).toBeVisible();
+  await memberRow.getByRole("button", { name: "启用用户" }).click();
+  await expect(memberRow.getByText("正常")).toBeVisible();
+  await memberRow.getByRole("button", { name: "编辑用户" }).click();
+  await page
+    .getByRole("dialog")
+    .getByLabel("邮箱", { exact: true })
+    .fill("renamed@example.test");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(
+    page.getByText("renamed@example.test", { exact: true }),
+  ).toBeVisible();
+  await page
+    .locator(".resource-line")
+    .filter({ hasText: "renamed@example.test" })
+    .getByRole("button", { name: "重置密码" })
+    .click();
+  await page
+    .getByRole("dialog")
+    .getByLabel("新密码（至少 12 位）")
+    .fill("ResetPassword-1234");
+  await page.getByRole("button", { name: "重置", exact: true }).click();
+  await expect(page.getByText("密码已重置")).toBeVisible();
+  await page
+    .locator(".resource-line")
+    .filter({ hasText: "renamed@example.test" })
+    .getByRole("button", { name: "删除用户" })
+    .click();
+  await page
+    .getByLabel(/输入「renamed@example\.test」确认/)
+    .fill("renamed@example.test");
+  await page.getByRole("button", { name: "确认执行" }).click();
+  await expect(page.getByText("成员已删除")).toBeVisible();
   await page
     .locator("nav")
     .getByRole("button", { name: "概览", exact: true })

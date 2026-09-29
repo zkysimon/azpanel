@@ -42,6 +42,7 @@ const config: Config = {
   writesEnabled: !preflight,
   cookieSecure: false,
   azureInterval: 2500,
+  avatarSource: "local",
 };
 let root = "";
 let writes = 0,

@@ -7,6 +7,7 @@ import type {
   Credentials,
   Invite,
   Json,
+  ManagedUser,
   Task,
   User,
   VirtualMachine,
@@ -41,7 +42,15 @@ export class Store {
       CREATE INDEX IF NOT EXISTS audit_owner ON audit(user_id, created_at);
       CREATE INDEX IF NOT EXISTS presets_owner ON presets(user_id, updated_at);
       INSERT OR IGNORE INTO settings(key,value) VALUES('registration_open','0');
-      PRAGMA user_version=3;`);
+      PRAGMA user_version=4;`);
+    // Additive migration for databases created before user management existed.
+    const userColumns = (
+      this.db.prepare("PRAGMA table_info(users)").all() as { name: string }[]
+    ).map((column) => column.name);
+    if (!userColumns.includes("disabled"))
+      this.db.exec(
+        "ALTER TABLE users ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0",
+      );
     this.db
       .prepare(
         "UPDATE tasks SET status='interrupted', progress='服务重启，请先刷新资源状态后再操作', updated_at=? WHERE status IN ('running','queued')",
@@ -65,9 +74,129 @@ export class Store {
   ): User {
     const user = { id: randomUUID(), email: email.toLowerCase(), role };
     this.db
-      .prepare("INSERT INTO users VALUES(?,?,?,?,?)")
+      .prepare(
+        "INSERT INTO users(id,email,password,role,created_at,disabled) VALUES(?,?,?,?,?,0)",
+      )
       .run(user.id, user.email, hashPassword(password), role, Date.now());
     return user;
+  }
+  /** Admin listing with status and per-user resource counts. */
+  managedUsers(): ManagedUser[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT u.id,u.email,u.role,u.disabled,u.created_at AS createdAt,
+           (SELECT COUNT(*) FROM accounts a WHERE a.user_id=u.id) AS accounts,
+           (SELECT COUNT(*) FROM machines m JOIN accounts a ON a.id=m.account_id WHERE a.user_id=u.id) AS machines
+           FROM users u ORDER BY u.created_at`,
+        )
+        .all() as unknown as (Omit<ManagedUser, "disabled"> & {
+        disabled: number;
+      })[]
+    ).map((row) => ({ ...row, disabled: row.disabled === 1 }));
+  }
+  isDisabled(id: string): boolean {
+    const row = this.db
+      .prepare("SELECT disabled FROM users WHERE id=?")
+      .get(id) as { disabled: number } | undefined;
+    return row?.disabled === 1;
+  }
+  countAdmins(excludeId?: string): number {
+    const row = excludeId
+      ? (this.db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM users WHERE role='admin' AND id<>?",
+          )
+          .get(excludeId) as { n: number })
+      : (this.db
+          .prepare("SELECT COUNT(*) AS n FROM users WHERE role='admin'")
+          .get() as { n: number });
+    return row.n;
+  }
+  private requireUser(id: string): { id: string; email: string; role: string } {
+    const row = this.db
+      .prepare("SELECT id,email,role FROM users WHERE id=?")
+      .get(id) as { id: string; email: string; role: string } | undefined;
+    if (!row) throw new AppError(404, "用户不存在");
+    return row;
+  }
+  updateUser(
+    actorId: string,
+    id: string,
+    input: { email?: string; role?: User["role"] },
+  ): void {
+    const target = this.requireUser(id);
+    const email = input.email?.toLowerCase();
+    if (email && email !== target.email) {
+      if (this.db.prepare("SELECT id FROM users WHERE email=?").get(email))
+        throw new AppError(409, "邮箱已被使用");
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (
+        input.role &&
+        input.role !== "admin" &&
+        target.role === "admin" &&
+        this.countAdmins(id) === 0
+      )
+        throw new AppError(422, "至少需要保留一名管理员");
+      this.db
+        .prepare("UPDATE users SET email=?, role=? WHERE id=?")
+        .run(email ?? target.email, input.role ?? target.role, id);
+      // Role/email changes invalidate the member's sessions so they re-login.
+      if (input.role || email) this.purgeSessions(id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  resetPassword(id: string, password: string): void {
+    this.requireUser(id);
+    this.db
+      .prepare("UPDATE users SET password=? WHERE id=?")
+      .run(hashPassword(password), id);
+    this.purgeSessions(id);
+  }
+  setDisabled(actorId: string, id: string, disabled: boolean): void {
+    const target = this.requireUser(id);
+    if (disabled && id === actorId)
+      throw new AppError(422, "不能停用当前登录的管理员账户");
+    if (disabled && target.role === "admin" && this.countAdmins(id) === 0)
+      throw new AppError(422, "至少需要保留一名启用中的管理员");
+    this.db
+      .prepare("UPDATE users SET disabled=? WHERE id=?")
+      .run(disabled ? 1 : 0, id);
+    if (disabled) this.purgeSessions(id);
+  }
+  deleteUser(actorId: string, id: string): void {
+    const target = this.requireUser(id);
+    if (id === actorId) throw new AppError(422, "不能删除当前登录的账户");
+    if (target.role === "admin" && this.countAdmins(id) === 0)
+      throw new AppError(422, "至少需要保留一名管理员");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // Referencing rows are removed explicitly because the tables predate
+      // ON DELETE CASCADE for accounts and audit.
+      this.db
+        .prepare(
+          "DELETE FROM machines WHERE account_id IN (SELECT id FROM accounts WHERE user_id=?)",
+        )
+        .run(id);
+      this.db.prepare("DELETE FROM accounts WHERE user_id=?").run(id);
+      this.db.prepare("DELETE FROM audit WHERE user_id=?").run(id);
+      this.db.prepare("DELETE FROM tasks WHERE user_id=?").run(id);
+      this.db.prepare("DELETE FROM presets WHERE user_id=?").run(id);
+      this.purgeSessions(id);
+      this.db.prepare("DELETE FROM users WHERE id=?").run(id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  private purgeSessions(userId: string) {
+    this.db.prepare("DELETE FROM sessions WHERE user_id=?").run(userId);
   }
   accounts(userId: string): Account[] {
     return (

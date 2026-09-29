@@ -11,6 +11,7 @@ export const testConfig: Config = {
   writesEnabled: false,
   cookieSecure: false,
   azureInterval: 0,
+  avatarSource: "gravatar",
 };
 export const credentials: Credentials = {
   appId: "00000000-0000-4000-8000-000000000001",

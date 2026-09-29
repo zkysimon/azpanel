@@ -366,3 +366,19 @@ test("ambiguous network failure on a write is not retried", async () => {
   );
   assert.equal(calls, 1);
 });
+
+test("avatar URLs hash the email and honor the configured source", async () => {
+  const { avatarUrl, avatarTint } = await import("../server/avatar.js");
+  const url = avatarUrl("Person@Example.com", "gravatar")!;
+  assert.match(url, /^https:\/\/www\.gravatar\.com\/avatar\/[a-f0-9]{64}\?/);
+  assert.ok(!url.includes("person"), "the email itself must never appear");
+  // Case/whitespace normalisation yields a stable hash.
+  assert.equal(
+    avatarUrl("  person@example.com  ", "gravatar"),
+    avatarUrl("PERSON@EXAMPLE.COM", "gravatar"),
+  );
+  assert.equal(avatarUrl("a@b.co", "local"), null);
+  assert.equal(avatarUrl("a@b.co", "none"), null);
+  assert.equal(avatarTint("a@b.co"), avatarTint("A@B.CO"));
+  assert.ok(avatarTint("a@b.co") >= 0 && avatarTint("a@b.co") < 6);
+});

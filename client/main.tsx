@@ -61,6 +61,7 @@ import {
   Menu,
   Moon,
   MoreHorizontal,
+  Pencil,
   Plus,
   RefreshCw,
   Save,
@@ -71,6 +72,8 @@ import {
   Sun,
   Ticket,
   Trash2,
+  UserCheck,
+  UserX,
   X,
   Zap,
 } from "lucide-react";
@@ -80,6 +83,7 @@ import type {
   Invite,
   Json,
   Location,
+  ManagedUser,
   MetricPoint,
   Overview,
   Session,
@@ -2173,12 +2177,20 @@ function SettingsPage({ session, notify }: PageProps) {
   const { data: audit } = useLoad(() => api<Audit[]>("/audit"), []);
   const [current, setCurrent] = useState(""),
     [password, setPassword] = useState(""),
-    [users, setUsers] = useState<User[]>([]),
+    [users, setUsers] = useState<ManagedUser[]>([]),
     [open, setOpen] = useState(false),
     [email, setEmail] = useState(""),
     [newPassword, setNewPassword] = useState(""),
     [role, setRole] = useState("user"),
     [busy, setBusy] = useState(false),
+    [editing, setEditing] = useState<ManagedUser | null>(null),
+    [editEmail, setEditEmail] = useState(""),
+    [editRole, setEditRole] = useState("user"),
+    [manageError, setManageError] = useState(""),
+    [resetTarget, setResetTarget] = useState<ManagedUser | null>(null),
+    [resetValue, setResetValue] = useState(""),
+    [deleteTarget, setDeleteTarget] = useState<ManagedUser | null>(null),
+    [deleteConfirm, setDeleteConfirm] = useState(""),
     [invites, setInvites] = useState<Invite[]>([]),
     [registrationOpen, setRegistrationOpen] = useState(false),
     [inviteOpen, setInviteOpen] = useState(false),
@@ -2186,6 +2198,13 @@ function SettingsPage({ session, notify }: PageProps) {
     [inviteMaxUses, setInviteMaxUses] = useState("0"),
     [inviteExpiry, setInviteExpiry] = useState("0"),
     [inviteError, setInviteError] = useState("");
+  const loadUsers = useCallback(async () => {
+    try {
+      setUsers(await api<ManagedUser[]>("/users"));
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }, [notify]);
   const loadInvites = useCallback(async () => {
     try {
       const data = await api<{ registrationOpen: boolean; invites: Invite[] }>(
@@ -2199,12 +2218,10 @@ function SettingsPage({ session, notify }: PageProps) {
   }, [notify]);
   useEffect(() => {
     if (session.user?.role === "admin") {
-      void api<User[]>("/users")
-        .then(setUsers)
-        .catch((e) => notify(e.message));
+      void loadUsers();
       void loadInvites();
     }
-  }, [session.user?.role, notify, loadInvites]);
+  }, [session.user?.role, loadUsers, loadInvites]);
   return (
     <>
       <Heading
@@ -2216,7 +2233,9 @@ function SettingsPage({ session, notify }: PageProps) {
         <Panel title="登录与安全">
           <div className="settings-content">
             <div className="identity">
-              <Avatar>{session.user?.email[0].toUpperCase()}</Avatar>
+              <Avatar src={session.user?.avatarUrl ?? undefined}>
+                {session.user?.email[0].toUpperCase()}
+              </Avatar>
               <div>
                 <b>{session.user?.email}</b>
                 <p>{session.user?.role === "admin" ? "管理员" : "普通成员"}</p>
@@ -2283,7 +2302,7 @@ function SettingsPage({ session, notify }: PageProps) {
       </div>
       {session.user?.role === "admin" && (
         <Panel
-          title="工作空间成员"
+          title={`工作空间成员（${users.length}）`}
           action={
             <Button
               onClick={() => setOpen(true)}
@@ -2293,20 +2312,111 @@ function SettingsPage({ session, notify }: PageProps) {
             </Button>
           }
         >
-          {users.map((user) => (
-            <div className="resource-line" key={user.id}>
-              <Avatar sx={{ width: 34, height: 34 }}>
-                {user.email[0].toUpperCase()}
-              </Avatar>
-              <div className="resource-line-main">
-                <b>{user.email}</b>
+          {users.map((member) => {
+            const self = member.id === session.user?.id;
+            return (
+              <div className="resource-line" key={member.id}>
+                <Avatar
+                  sx={{ width: 34, height: 34 }}
+                  src={member.avatarUrl ?? undefined}
+                >
+                  {member.email[0].toUpperCase()}
+                </Avatar>
+                <div className="resource-line-main">
+                  <b>{member.email}</b>
+                  <span>
+                    {member.accounts} 个账户 · {member.machines} 台虚拟机 ·{" "}
+                    {member.createdAt ? date(member.createdAt) : ""}
+                  </span>
+                </div>
+                <Chip
+                  size="small"
+                  color={member.role === "admin" ? "primary" : "default"}
+                  label={member.role === "admin" ? "管理员" : "成员"}
+                />
+                <Chip
+                  size="small"
+                  color={member.disabled ? "error" : "success"}
+                  label={member.disabled ? "已停用" : "正常"}
+                />
+                <Tooltip title="编辑邮箱与角色">
+                  <span>
+                    <IconButton
+                      aria-label="编辑用户"
+                      onClick={() => {
+                        setEditing(member);
+                        setEditEmail(member.email);
+                        setEditRole(member.role);
+                        setManageError("");
+                      }}
+                    >
+                      <Pencil size={16} />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+                <Tooltip title="重置密码">
+                  <IconButton
+                    aria-label="重置密码"
+                    onClick={() => {
+                      setResetTarget(member);
+                      setResetValue("");
+                      setManageError("");
+                    }}
+                  >
+                    <KeyRound size={16} />
+                  </IconButton>
+                </Tooltip>
+                <Tooltip
+                  title={
+                    self
+                      ? "不能停用自己"
+                      : member.disabled
+                        ? "启用账户"
+                        : "停用账户"
+                  }
+                >
+                  <span>
+                    <IconButton
+                      aria-label={member.disabled ? "启用用户" : "停用用户"}
+                      disabled={self}
+                      onClick={async () => {
+                        try {
+                          await api(`/users/${member.id}`, "PATCH", {
+                            disabled: !member.disabled,
+                          });
+                          await loadUsers();
+                          notify(member.disabled ? "账户已启用" : "账户已停用");
+                        } catch (e) {
+                          notify((e as Error).message);
+                        }
+                      }}
+                    >
+                      {member.disabled ? (
+                        <UserCheck size={16} />
+                      ) : (
+                        <UserX size={16} />
+                      )}
+                    </IconButton>
+                  </span>
+                </Tooltip>
+                <Tooltip title={self ? "不能删除自己" : "删除用户"}>
+                  <span>
+                    <IconButton
+                      aria-label="删除用户"
+                      disabled={self}
+                      onClick={() => {
+                        setDeleteTarget(member);
+                        setDeleteConfirm("");
+                        setManageError("");
+                      }}
+                    >
+                      <Trash2 size={16} />
+                    </IconButton>
+                  </span>
+                </Tooltip>
               </div>
-              <Chip
-                size="small"
-                label={user.role === "admin" ? "管理员" : "成员"}
-              />
-            </div>
-          ))}
+            );
+          })}
         </Panel>
       )}
       {session.user?.role === "admin" && (
@@ -2547,6 +2657,124 @@ function SettingsPage({ session, notify }: PageProps) {
           </Button>
         </DialogActions>
       </Dialog>
+      <Dialog
+        open={!!editing}
+        onClose={() => setEditing(null)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>编辑成员</DialogTitle>
+        <DialogContent>
+          <Stack spacing={3} sx={{ pt: 1 }}>
+            <LoadError error={manageError} />
+            <TextField
+              label="邮箱"
+              type="email"
+              value={editEmail}
+              onChange={(e) => setEditEmail(e.target.value)}
+            />
+            <TextField
+              select
+              label="角色"
+              value={editRole}
+              onChange={(e) => setEditRole(e.target.value)}
+            >
+              <MenuItem value="user">普通成员</MenuItem>
+              <MenuItem value="admin">管理员</MenuItem>
+            </TextField>
+            <Alert severity="info">
+              修改邮箱或角色后，该成员的登录会话会失效，需要重新登录。
+            </Alert>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setEditing(null)}>取消</Button>
+          <Button
+            variant="contained"
+            onClick={async () => {
+              if (!editing) return;
+              setManageError("");
+              try {
+                await api(`/users/${editing.id}`, "PATCH", {
+                  email: editEmail,
+                  role: editRole,
+                });
+                setEditing(null);
+                await loadUsers();
+                notify("成员已更新");
+              } catch (e) {
+                setManageError((e as Error).message);
+              }
+            }}
+          >
+            保存
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <Dialog
+        open={!!resetTarget}
+        onClose={() => setResetTarget(null)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>重置密码</DialogTitle>
+        <DialogContent>
+          <Stack spacing={3} sx={{ pt: 1 }}>
+            <LoadError error={manageError} />
+            <Alert severity="warning">
+              将为 {resetTarget?.email}{" "}
+              设置新密码，该成员的所有登录会话会立即失效。
+            </Alert>
+            <TextField
+              label="新密码（至少 12 位）"
+              type="password"
+              value={resetValue}
+              onChange={(e) => setResetValue(e.target.value)}
+            />
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setResetTarget(null)}>取消</Button>
+          <Button
+            variant="contained"
+            disabled={resetValue.length < 12}
+            onClick={async () => {
+              if (!resetTarget) return;
+              setManageError("");
+              try {
+                await api(`/users/${resetTarget.id}/password`, "PUT", {
+                  password: resetValue,
+                });
+                setResetTarget(null);
+                notify("密码已重置");
+              } catch (e) {
+                setManageError((e as Error).message);
+              }
+            }}
+          >
+            重置
+          </Button>
+        </DialogActions>
+      </Dialog>
+      <ConfirmDialog
+        open={!!deleteTarget}
+        title="删除成员"
+        description={`将删除 ${deleteTarget?.email} 及其在本地的 Azure 账户、虚拟机缓存、预设和审计记录。云端资源不会被删除。`}
+        target={deleteTarget?.email ?? ""}
+        value={deleteConfirm}
+        onChange={setDeleteConfirm}
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={async () => {
+          try {
+            await api(`/users/${deleteTarget!.id}`, "DELETE");
+            setDeleteTarget(null);
+            await loadUsers();
+            notify("成员已删除");
+          } catch (e) {
+            notify((e as Error).message);
+          }
+        }}
+      />
     </>
   );
 }
@@ -2733,6 +2961,7 @@ function App() {
                   <Tooltip title={session.user.email}>
                     <Avatar
                       className="user-avatar"
+                      src={session.user.avatarUrl ?? undefined}
                       onClick={() => navigate("settings")}
                     >
                       {session.user.email[0].toUpperCase()}

@@ -23,6 +23,7 @@ import {
   sizeSchema,
 } from "../shared/validation.js";
 import { AppError, Store } from "./store.js";
+import { avatarUrl } from "./avatar.js";
 import { hashPassword, hashToken, verifyPassword } from "./security.js";
 import type { Config } from "./config.js";
 import { Azure, RequestGate, selectSubscription } from "./azure.js";
@@ -82,11 +83,11 @@ export async function buildApp(
     if (token) {
       const row = store.db
         .prepare(
-          "SELECT u.id,u.email,u.role,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>?",
+          "SELECT u.id,u.email,u.role,u.disabled,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at>?",
         )
         .get(hashToken(token), Date.now()) as unknown as
-        (User & { csrf: string }) | undefined;
-      if (row) {
+        (User & { csrf: string; disabled: number }) | undefined;
+      if (row && row.disabled !== 1) {
         request.currentUser = { id: row.id, email: row.email, role: row.role };
         request.csrf = row.csrf;
       }
@@ -164,7 +165,12 @@ export async function buildApp(
   }
   app.get("/api/health", async () => ({ status: "ok", version: "2.0.0" }));
   app.get("/api/session", async (request) => ({
-    user: request.currentUser,
+    user: request.currentUser
+      ? {
+          ...request.currentUser,
+          avatarUrl: avatarUrl(request.currentUser.email, config.avatarSource),
+        }
+      : null,
     csrf: request.csrf,
     writesEnabled: config.writesEnabled,
     registrationOpen: store.setting("registration_open") === "1",
@@ -198,9 +204,11 @@ export async function buildApp(
       const row = store.db
         .prepare("SELECT * FROM users WHERE email=?")
         .get(input.email) as unknown as
-        (User & { password: string }) | undefined;
+        (User & { password: string; disabled: number }) | undefined;
       if (!row || !verifyPassword(input.password, row.password))
         throw new AppError(401, "邮箱或密码不正确");
+      if (row.disabled === 1)
+        throw new AppError(403, "账户已被停用，请联系管理员");
       const token = randomBytes(32).toString("hex"),
         csrf = randomBytes(24).toString("hex");
       store.db
@@ -218,7 +226,12 @@ export async function buildApp(
       });
       store.audit(row.id, "登录", "控制台");
       return {
-        user: { id: row.id, email: row.email, role: row.role },
+        user: {
+          id: row.id,
+          email: row.email,
+          role: row.role,
+          avatarUrl: avatarUrl(row.email, config.avatarSource),
+        },
         csrf,
         writesEnabled: config.writesEnabled,
         registrationOpen: store.setting("registration_open") === "1",
@@ -599,15 +612,14 @@ export async function buildApp(
       .all(user(request).id),
   );
   app.get("/api/users", async (request) => {
-    if (user(request).role !== "admin")
-      throw new AppError(403, "需要管理员权限");
-    return store.db
-      .prepare("SELECT id,email,role FROM users ORDER BY created_at")
-      .all();
+    requireAdmin(request);
+    return store.managedUsers().map((member) => ({
+      ...member,
+      avatarUrl: avatarUrl(member.email, config.avatarSource),
+    }));
   });
   app.post("/api/users", async (request) => {
-    if (user(request).role !== "admin")
-      throw new AppError(403, "需要管理员权限");
+    requireAdmin(request);
     const input = z
       .object({
         email: z.string().email(),
@@ -624,6 +636,54 @@ export async function buildApp(
     const created = store.createUser(input.email, input.password, input.role);
     store.audit(user(request).id, "创建用户", input.email);
     return created;
+  });
+  app.patch("/api/users/:id", async (request) => {
+    requireAdmin(request);
+    const { id } = idParams.parse(request.params);
+    const input = z
+      .object({
+        email: z.string().email().optional(),
+        role: z.enum(["admin", "user"]).optional(),
+        disabled: z.boolean().optional(),
+      })
+      .parse(request.body);
+    if (input.email || input.role)
+      store.updateUser(user(request).id, id, {
+        email: input.email,
+        role: input.role,
+      });
+    if (input.disabled !== undefined)
+      store.setDisabled(user(request).id, id, input.disabled);
+    store.audit(
+      user(request).id,
+      "更新用户",
+      [
+        input.email,
+        input.role,
+        input.disabled === undefined ? null : `disabled=${input.disabled}`,
+      ]
+        .filter(Boolean)
+        .join(" ") || id,
+    );
+    return store.managedUsers().find((member) => member.id === id);
+  });
+  app.put("/api/users/:id/password", async (request) => {
+    requireAdmin(request);
+    const { id } = idParams.parse(request.params);
+    const { password } = z
+      .object({ password: z.string().min(12).max(256) })
+      .parse(request.body);
+    store.resetPassword(id, password);
+    store.audit(user(request).id, "重置用户密码", id);
+    return { ok: true };
+  });
+  app.delete("/api/users/:id", async (request) => {
+    requireAdmin(request);
+    const { id } = idParams.parse(request.params);
+    const target = store.managedUsers().find((member) => member.id === id);
+    store.deleteUser(user(request).id, id);
+    store.audit(user(request).id, "删除用户", target?.email ?? id);
+    return { ok: true };
   });
   const staticRoot = resolve("dist/client");
   if (existsSync(staticRoot)) {
