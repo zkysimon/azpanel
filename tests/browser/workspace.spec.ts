@@ -96,6 +96,25 @@ test("login, navigation, MD3 theme, resource details, quota and mobile layout", 
     .click();
   await page.getByRole("button", { name: "加载可用规格" }).click();
   await expect(page.getByLabel("虚拟机规格")).toContainText("B1s");
+  await page.getByLabel("允许管理访问的来源 CIDR").fill("198.51.100.7/32");
+  await page
+    .getByLabel("RSA SSH 公钥")
+    .fill("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ== test@example");
+  // Preset configuration: save current settings and reload them later.
+  await page.getByRole("button", { name: "保存为预设" }).click();
+  await page.getByLabel("预设名称").fill("测试预设");
+  await page.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(page.getByText("预设已保存")).toBeVisible();
+  const preset = page.getByRole("combobox", { name: "预设配置" });
+  await expect(preset).toContainText("测试预设");
+  await page.getByLabel("允许管理访问的来源 CIDR").fill("0.0.0.0/0");
+  await preset.click();
+  await page.getByRole("option", { name: "不使用预设" }).click();
+  await preset.click();
+  await page.getByRole("option", { name: /测试预设/ }).click();
+  await expect(page.getByLabel("允许管理访问的来源 CIDR")).toHaveValue(
+    "198.51.100.7/32",
+  );
   await expect(
     page.getByRole("button", { name: "创建虚拟机", exact: true }),
   ).toBeDisabled();

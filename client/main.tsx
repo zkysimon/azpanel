@@ -43,6 +43,7 @@ import {
   ArrowRight,
   ArrowUpRight,
   Bell,
+  BookmarkPlus,
   Check,
   CheckCheck,
   ChevronRight,
@@ -62,6 +63,7 @@ import {
   MoreHorizontal,
   Plus,
   RefreshCw,
+  Save,
   Search,
   Server,
   Settings,
@@ -83,6 +85,7 @@ import type {
   Task,
   User,
   VirtualMachine,
+  VmPreset,
 } from "../shared/types.js";
 import type { CreateVm } from "../shared/validation.js";
 import {
@@ -1194,6 +1197,13 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     [loadingLocations, setLoadingLocations] = useState(false),
     [loadingImages, setLoadingImages] = useState(false),
     [loadingSkus, setLoadingSkus] = useState(false),
+    [presets, setPresets] = useState<VmPreset[]>([]),
+    [presetId, setPresetId] = useState(""),
+    [saveOpen, setSaveOpen] = useState(false),
+    [presetName, setPresetName] = useState(""),
+    [presetDefault, setPresetDefault] = useState(false),
+    [presetBusy, setPresetBusy] = useState(false),
+    [presetError, setPresetError] = useState(""),
     [error, setError] = useState("");
   const [form, setForm] = useState<CreateVm>({
     name: "",
@@ -1219,6 +1229,72 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     sku: string;
   }) => `${option.publisher}|${option.offer}|${option.sku}`;
   const windows = looksLikeWindows(form.image);
+  const applyPreset = (preset: VmPreset) => {
+    setForm((old) => ({ ...old, ...preset.settings }));
+    setPresetId(preset.id);
+  };
+  // Presets are personal saved settings so the wizard does not need re-typing.
+  useEffect(() => {
+    api<VmPreset[]>("/presets")
+      .then((list) => {
+        setPresets(list);
+        const preferred = list.find((preset) => preset.isDefault);
+        if (preferred) applyPreset(preferred);
+      })
+      .catch(() => undefined);
+  }, []);
+  async function savePresetDialog() {
+    const input = {
+      name: presetName.trim(),
+      isDefault: presetDefault,
+      settings: {
+        location: form.location,
+        size: form.size,
+        image: form.image,
+        diskSize: form.diskSize,
+        username: form.username,
+        authentication: form.authentication,
+        sshKey: form.sshKey,
+        password: form.password,
+        allowedSource: form.allowedSource,
+        ipv6: form.ipv6,
+        customData: form.customData,
+      },
+    };
+    setPresetBusy(true);
+    setPresetError("");
+    try {
+      const existing = presets.find((preset) => preset.id === presetId);
+      const saved = existing
+        ? await api<VmPreset>(`/presets/${existing.id}`, "PUT", input)
+        : await api<VmPreset>("/presets", "POST", input);
+      setPresets((list) =>
+        [...list.filter((preset) => preset.id !== saved.id), saved].sort(
+          (a, b) =>
+            Number(b.isDefault) - Number(a.isDefault) ||
+            b.updatedAt - a.updatedAt,
+        ),
+      );
+      setPresetId(saved.id);
+      setSaveOpen(false);
+      notify(existing ? "预设已更新" : "预设已保存");
+    } catch (e) {
+      setPresetError((e as Error).message);
+    } finally {
+      setPresetBusy(false);
+    }
+  }
+  async function removePreset() {
+    if (!presetId) return;
+    try {
+      await api(`/presets/${presetId}`, "DELETE");
+      setPresets((list) => list.filter((preset) => preset.id !== presetId));
+      setPresetId("");
+      notify("预设已删除");
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }
   useEffect(() => {
     if (!accountId && accounts?.length)
       setAccountId(
@@ -1312,6 +1388,54 @@ function CreatePage({ session, notify, navigate }: PageProps) {
       />
       <form onSubmit={submit}>
         <LoadError error={error} />
+        <Paper className="preset-bar">
+          <BookmarkPlus size={19} />
+          <TextField
+            select
+            size="small"
+            label="预设配置"
+            value={presetId}
+            sx={{ minWidth: 220 }}
+            onChange={(e) => {
+              const preset = presets.find((item) => item.id === e.target.value);
+              if (preset) applyPreset(preset);
+              else setPresetId("");
+            }}
+          >
+            <MenuItem value="">
+              <em>不使用预设</em>
+            </MenuItem>
+            {presets.map((preset) => (
+              <MenuItem key={preset.id} value={preset.id}>
+                {preset.name}
+                {preset.isDefault ? "（默认）" : ""}
+              </MenuItem>
+            ))}
+          </TextField>
+          <Button
+            startIcon={<Save size={16} />}
+            onClick={() => {
+              const current = presets.find((item) => item.id === presetId);
+              setPresetName(current?.name ?? "");
+              setPresetDefault(current?.isDefault ?? false);
+              setPresetError("");
+              setSaveOpen(true);
+            }}
+          >
+            {presetId ? "更新此预设" : "保存为预设"}
+          </Button>
+          <Button
+            color="error"
+            startIcon={<Trash2 size={16} />}
+            disabled={!presetId}
+            onClick={removePreset}
+          >
+            删除
+          </Button>
+          <span className="preset-hint">
+            保存常用区域、镜像、规格与登录方式，下次一键套用。
+          </span>
+        </Paper>
         {!session.writesEnabled && (
           <Alert severity="info" sx={{ mb: 3 }}>
             当前为只读模式。可以准备配置、查询规格；创建需由管理员启用云端写操作。
@@ -1603,6 +1727,47 @@ function CreatePage({ session, notify, navigate }: PageProps) {
           </aside>
         </div>
       </form>
+      <Dialog open={saveOpen} onClose={() => !presetBusy && setSaveOpen(false)}>
+        <DialogTitle>保存预设配置</DialogTitle>
+        <DialogContent>
+          <Stack spacing={2} sx={{ mt: 1, minWidth: 320 }}>
+            <LoadError error={presetError} />
+            <TextField
+              label="预设名称"
+              value={presetName}
+              autoFocus
+              onChange={(e) => setPresetName(e.target.value)}
+              helperText="例如「香港 B1s」「东京 2C4G」"
+            />
+            <TextField
+              select
+              label="默认预设"
+              value={String(presetDefault)}
+              onChange={(e) => setPresetDefault(e.target.value === "true")}
+              helperText="设为默认后，进入创建页会自动套用"
+            >
+              <MenuItem value="false">否</MenuItem>
+              <MenuItem value="true">是</MenuItem>
+            </TextField>
+            <Alert severity="info">
+              预设会保存区域、镜像、规格、系统盘、登录方式与网络设置；不保存虚拟机名称。
+              预设含密码时以加密方式存储。
+            </Alert>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setSaveOpen(false)} disabled={presetBusy}>
+            取消
+          </Button>
+          <Button
+            variant="contained"
+            disabled={presetBusy || !presetName.trim()}
+            onClick={savePresetDialog}
+          >
+            {presetBusy ? "保存中…" : "保存"}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </>
   );
 }

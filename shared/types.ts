@@ -84,6 +84,14 @@ export interface Location {
   regionalDisplayName: string;
   geography: string;
 }
+import type { VmSettings } from "./validation.js";
+export interface VmPreset {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  settings: VmSettings;
+  updatedAt: number;
+}
 export interface Quota {
   name: string;
   label: string;

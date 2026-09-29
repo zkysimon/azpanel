@@ -6,10 +6,11 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { Account, Credentials, User } from "../shared/types.js";
+import type { Account, Credentials, User, VmPreset } from "../shared/types.js";
 import {
   accountSchema,
   createVmSchema,
+  presetSchema,
   regionSchema,
   sizeSchema,
 } from "../shared/validation.js";
@@ -470,6 +471,43 @@ export async function buildApp(
     };
   });
   app.get("/api/tasks", async (request) => store.tasks(user(request).id));
+  app.get("/api/presets", async (request) => store.presets(user(request).id));
+  app.post("/api/presets", async (request) => {
+    const input = presetSchema.parse(request.body);
+    const now = Date.now();
+    const preset: VmPreset = {
+      id: randomUUID(),
+      name: input.name,
+      isDefault: input.isDefault,
+      settings: input.settings,
+      updatedAt: now,
+    };
+    store.savePreset(user(request).id, preset);
+    store.audit(user(request).id, "保存虚拟机预设", preset.name);
+    return preset;
+  });
+  app.put("/api/presets/:id", async (request) => {
+    const { id } = idParams.parse(request.params);
+    const existing = store.preset(user(request).id, id);
+    const input = presetSchema.parse(request.body);
+    const preset: VmPreset = {
+      ...existing,
+      name: input.name,
+      isDefault: input.isDefault,
+      settings: input.settings,
+      updatedAt: Date.now(),
+    };
+    store.savePreset(user(request).id, preset);
+    store.audit(user(request).id, "更新虚拟机预设", preset.name);
+    return preset;
+  });
+  app.delete("/api/presets/:id", async (request) => {
+    const { id } = idParams.parse(request.params);
+    store.preset(user(request).id, id);
+    store.deletePreset(user(request).id, id);
+    store.audit(user(request).id, "删除虚拟机预设", id);
+    return { ok: true };
+  });
   app.get("/api/audit", async (request) =>
     store.db
       .prepare(

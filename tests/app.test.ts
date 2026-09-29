@@ -202,3 +202,142 @@ test("resource deletion verifies confirmation and never deletes the containing r
     await app.close();
   }
 });
+
+test("presets save, encrypt, isolate per user, and keep a single default", async () => {
+  const store = new Store(testConfig, true);
+  const { app } = await buildApp(testConfig, {
+    store,
+    azure: new Azure(
+      new RequestGate(0),
+      async () => Response.json({ value: [] }),
+      async () => "token",
+    ),
+  });
+  const settings = {
+    location: "eastasia",
+    size: "Standard_B1s",
+    image: {
+      publisher: "Canonical",
+      offer: "ubuntu-24_04-lts",
+      sku: "server",
+      version: "latest",
+    },
+    diskSize: 30,
+    username: "azureuser",
+    authentication: "password",
+    sshKey: "",
+    password: "Preset!Password123",
+    allowedSource: "203.0.113.1/32",
+    ipv6: false,
+    customData: "",
+  };
+  try {
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/login",
+      payload: {
+        email: testConfig.adminEmail,
+        password: testConfig.adminPassword,
+      },
+    });
+    const session = login.json();
+    const headers = {
+      cookie: "azpanel_session=" + login.cookies[0].value,
+      "x-csrf-token": session.csrf,
+    };
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/presets",
+      headers,
+      payload: { name: "香港 B1s", isDefault: true, settings },
+    });
+    assert.equal(created.statusCode, 200, created.body);
+    const preset = created.json();
+    assert.equal(preset.settings.password, "Preset!Password123");
+    // Stored encrypted at rest.
+    const raw = store.db.prepare("SELECT data FROM presets").get() as {
+      data: string;
+    };
+    assert.ok(!raw.data.includes("Preset!Password123"));
+    const second = await app.inject({
+      method: "POST",
+      url: "/api/presets",
+      headers,
+      payload: { name: "东京 2C4G", isDefault: true, settings },
+    });
+    assert.equal(second.statusCode, 200);
+    const list = (await app.inject({ url: "/api/presets", headers })).json();
+    assert.equal(list.length, 2);
+    assert.equal(list[0].name, "东京 2C4G", "default must sort first");
+    assert.equal(
+      list.filter((item: { isDefault: boolean }) => item.isDefault).length,
+      1,
+      "only one default preset allowed",
+    );
+    const updated = await app.inject({
+      method: "PUT",
+      url: `/api/presets/${preset.id}`,
+      headers,
+      payload: { name: "香港 B1s 改名", isDefault: false, settings },
+    });
+    assert.equal(updated.statusCode, 200, updated.body);
+    // Another user cannot see or touch it.
+    const other = store.createUser(
+      "preset-other@example.test",
+      "OtherPassword-1234",
+    );
+    const otherLogin = await app.inject({
+      method: "POST",
+      url: "/api/login",
+      payload: { email: other.email, password: "OtherPassword-1234" },
+    });
+    const otherHeaders = {
+      cookie: "azpanel_session=" + otherLogin.cookies[0].value,
+      "x-csrf-token": otherLogin.json().csrf,
+    };
+    assert.deepEqual(
+      (await app.inject({ url: "/api/presets", headers: otherHeaders })).json(),
+      [],
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/presets/${preset.id}`,
+          headers: otherHeaders,
+        })
+      ).statusCode,
+      404,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/presets/${preset.id}`,
+          headers,
+        })
+      ).statusCode,
+      200,
+    );
+    assert.equal(
+      (await app.inject({ url: "/api/presets", headers })).json().length,
+      1,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/presets",
+          headers,
+          payload: {
+            name: "坏预设",
+            settings: { ...settings, allowedSource: "999.1.1.1/99" },
+          },
+        })
+      ).statusCode,
+      422,
+    );
+  } finally {
+    await app.close();
+  }
+});
