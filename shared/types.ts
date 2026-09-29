@@ -110,3 +110,27 @@ export interface Audit {
   target: string;
   createdAt: number;
 }
+export interface Invite {
+  id: string;
+  code: string;
+  note: string;
+  /** 0 means unlimited uses. */
+  maxUses: number;
+  uses: number;
+  /** null means never expires. */
+  expiresAt: number | null;
+  createdAt: number;
+  createdBy: string;
+  lastUsedAt: number | null;
+}
+export interface Session {
+  user: User | null;
+  csrf: string;
+  writesEnabled: boolean;
+  registrationOpen: boolean;
+}
+export interface InviteInput {
+  note: string;
+  maxUses: number;
+  expiresInDays: number | null;
+}

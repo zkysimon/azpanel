@@ -8,6 +8,19 @@ const store = new Store(testConfig, true);
 const admin = store.db.prepare("SELECT id FROM users LIMIT 1").get() as {
   id: string;
 };
+// Registration is open and has a known invite code for the browser test.
+store.setSetting("registration_open", "1");
+store.createInvite({
+  id: "invite-1",
+  code: "TEST-CODE-0001",
+  note: "浏览器测试",
+  maxUses: 0,
+  uses: 0,
+  expiresAt: null,
+  createdAt: Date.now(),
+  createdBy: testConfig.adminEmail,
+  lastUsedAt: null,
+});
 store.saveAccount(admin.id, account, credentials);
 store.replaceMachines(account.id, [
   { vm: machine, raw: {} },

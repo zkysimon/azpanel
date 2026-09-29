@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import type {
   Account,
   Credentials,
+  Invite,
   Json,
   Task,
   User,
@@ -33,11 +34,14 @@ export class Store {
       CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL, kind TEXT NOT NULL, target TEXT NOT NULL, status TEXT NOT NULL, progress TEXT NOT NULL, error TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL REFERENCES users(id), action TEXT NOT NULL, target TEXT NOT NULL, created_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS presets (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, is_default INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(user_id, name));
+      CREATE TABLE IF NOT EXISTS invites (id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, note TEXT NOT NULL, max_uses INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0, expires_at INTEGER, created_at INTEGER NOT NULL, created_by TEXT NOT NULL, last_used_at INTEGER);
+      CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS accounts_owner ON accounts(user_id);
       CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(user_id, created_at);
       CREATE INDEX IF NOT EXISTS audit_owner ON audit(user_id, created_at);
       CREATE INDEX IF NOT EXISTS presets_owner ON presets(user_id, updated_at);
-      PRAGMA user_version=2;`);
+      INSERT OR IGNORE INTO settings(key,value) VALUES('registration_open','0');
+      PRAGMA user_version=3;`);
     this.db
       .prepare(
         "UPDATE tasks SET status='interrupted', progress='服务重启，请先刷新资源状态后再操作', updated_at=? WHERE status IN ('running','queued')",
@@ -224,6 +228,81 @@ export class Store {
     this.db
       .prepare("DELETE FROM presets WHERE id=? AND user_id=?")
       .run(id, userId);
+  }
+  setting(key: string): string | null {
+    const row = this.db
+      .prepare("SELECT value FROM settings WHERE key=?")
+      .get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+  setSetting(key: string, value: string) {
+    this.db
+      .prepare(
+        "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      )
+      .run(key, value);
+  }
+  invites(): Invite[] {
+    return this.db
+      .prepare(
+        "SELECT id,code,note,max_uses AS maxUses,uses,expires_at AS expiresAt,created_at AS createdAt,created_by AS createdBy,last_used_at AS lastUsedAt FROM invites ORDER BY created_at DESC",
+      )
+      .all() as unknown as Invite[];
+  }
+  createInvite(invite: Invite) {
+    this.db
+      .prepare(
+        "INSERT INTO invites(id,code,note,max_uses,uses,expires_at,created_at,created_by,last_used_at) VALUES(?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        invite.id,
+        invite.code,
+        invite.note,
+        invite.maxUses,
+        invite.uses,
+        invite.expiresAt,
+        invite.createdAt,
+        invite.createdBy,
+        invite.lastUsedAt,
+      );
+  }
+  deleteInvite(id: string) {
+    this.db.prepare("DELETE FROM invites WHERE id=?").run(id);
+  }
+  /**
+   * Consumes one use of an invite and creates the user atomically, so an
+   * exhausted or expired code cannot register two accounts under a race.
+   */
+  redeemInvite(code: string, email: string, password: string): User {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const invite = this.db
+        .prepare("SELECT * FROM invites WHERE code=?")
+        .get(code) as unknown as
+        | {
+            id: string;
+            max_uses: number;
+            uses: number;
+            expires_at: number | null;
+          }
+        | undefined;
+      if (!invite) throw new AppError(422, "邀请码无效");
+      if (invite.expires_at !== null && invite.expires_at < Date.now())
+        throw new AppError(422, "邀请码已过期");
+      if (invite.max_uses > 0 && invite.uses >= invite.max_uses)
+        throw new AppError(422, "邀请码使用次数已达上限");
+      if (this.db.prepare("SELECT id FROM users WHERE email=?").get(email))
+        throw new AppError(409, "此邮箱已注册");
+      const user = this.createUser(email, password, "user");
+      this.db
+        .prepare("UPDATE invites SET uses=uses+1, last_used_at=? WHERE id=?")
+        .run(Date.now(), invite.id);
+      this.db.exec("COMMIT");
+      return user;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
   close() {
     this.db.close();

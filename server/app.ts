@@ -6,11 +6,19 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
-import type { Account, Credentials, User, VmPreset } from "../shared/types.js";
+import type {
+  Account,
+  Credentials,
+  Invite,
+  User,
+  VmPreset,
+} from "../shared/types.js";
 import {
   accountSchema,
   createVmSchema,
+  inviteSchema,
   presetSchema,
+  registerSchema,
   regionSchema,
   sizeSchema,
 } from "../shared/validation.js";
@@ -83,9 +91,12 @@ export async function buildApp(
         request.csrf = row.csrf;
       }
     }
-    const publicPath = ["/api/session", "/api/login", "/api/health"].includes(
-      route,
-    );
+    const publicPath = [
+      "/api/session",
+      "/api/login",
+      "/api/register",
+      "/api/health",
+    ].includes(route);
     if (!publicPath && !request.currentUser)
       throw new AppError(401, "请先登录");
     if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) {
@@ -100,7 +111,7 @@ export async function buildApp(
       if (request.headers["sec-fetch-site"] === "cross-site")
         throw new AppError(403, "拒绝跨站请求");
       if (
-        route !== "/api/login" &&
+        !["/api/login", "/api/register"].includes(route) &&
         (!request.csrf || request.headers["x-csrf-token"] !== request.csrf)
       )
         throw new AppError(403, "安全令牌已过期，请刷新页面");
@@ -156,7 +167,24 @@ export async function buildApp(
     user: request.currentUser,
     csrf: request.csrf,
     writesEnabled: config.writesEnabled,
+    registrationOpen: store.setting("registration_open") === "1",
   }));
+  app.post(
+    "/api/register",
+    { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
+    async (request) => {
+      if (store.setting("registration_open") !== "1")
+        throw new AppError(403, "当前未开放注册");
+      const input = registerSchema.parse(request.body);
+      const created = store.redeemInvite(
+        input.inviteCode,
+        input.email,
+        input.password,
+      );
+      store.audit(created.id, "注册", created.email);
+      return { user: created };
+    },
+  );
   app.post(
     "/api/login",
     { config: { rateLimit: { max: 8, timeWindow: "1 minute" } } },
@@ -193,6 +221,7 @@ export async function buildApp(
         user: { id: row.id, email: row.email, role: row.role },
         csrf,
         writesEnabled: config.writesEnabled,
+        registrationOpen: store.setting("registration_open") === "1",
       };
     },
   );
@@ -507,6 +536,60 @@ export async function buildApp(
     store.deletePreset(user(request).id, id);
     store.audit(user(request).id, "删除虚拟机预设", id);
     return { ok: true };
+  });
+  const requireAdmin = (request: FastifyRequest) => {
+    if (user(request).role !== "admin")
+      throw new AppError(403, "需要管理员权限");
+  };
+  app.get("/api/invites", async (request) => {
+    requireAdmin(request);
+    return {
+      registrationOpen: store.setting("registration_open") === "1",
+      invites: store.invites(),
+    };
+  });
+  app.post("/api/invites", async (request) => {
+    requireAdmin(request);
+    const input = inviteSchema.parse(request.body);
+    const now = Date.now();
+    // 10 readable groups from an unambiguous alphabet (no O/0/I/1 confusables).
+    const code = Array.from({ length: 4 }, () =>
+      Array.from(
+        { length: 4 },
+        () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[randomBytes(1)[0] % 32],
+      ).join(""),
+    ).join("-");
+    const invite: Invite = {
+      id: randomUUID(),
+      code,
+      note: input.note,
+      maxUses: input.maxUses,
+      uses: 0,
+      expiresAt:
+        input.expiresInDays === null
+          ? null
+          : now + input.expiresInDays * 86400000,
+      createdAt: now,
+      createdBy: user(request).email,
+      lastUsedAt: null,
+    };
+    store.createInvite(invite);
+    store.audit(user(request).id, "生成邀请码", invite.code);
+    return invite;
+  });
+  app.delete("/api/invites/:id", async (request) => {
+    requireAdmin(request);
+    const { id } = idParams.parse(request.params);
+    store.deleteInvite(id);
+    store.audit(user(request).id, "删除邀请码", id);
+    return { ok: true };
+  });
+  app.put("/api/invites/registration", async (request) => {
+    requireAdmin(request);
+    const { open } = z.object({ open: z.boolean() }).parse(request.body);
+    store.setSetting("registration_open", open ? "1" : "0");
+    store.audit(user(request).id, open ? "开放注册" : "关闭注册", "设置");
+    return { registrationOpen: open };
   });
   app.get("/api/audit", async (request) =>
     store.db

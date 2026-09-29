@@ -341,3 +341,192 @@ test("presets save, encrypt, isolate per user, and keep a single default", async
     await app.close();
   }
 });
+
+test("invite registration enforces expiry, use limits, and admin control", async () => {
+  const store = new Store(testConfig, true);
+  const { app } = await buildApp(testConfig, {
+    store,
+    azure: new Azure(
+      new RequestGate(0),
+      async () => Response.json({ value: [] }),
+      async () => "token",
+    ),
+  });
+  try {
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/login",
+      payload: {
+        email: testConfig.adminEmail,
+        password: testConfig.adminPassword,
+      },
+    });
+    const headers = {
+      cookie: "azpanel_session=" + login.cookies[0].value,
+      "x-csrf-token": login.json().csrf,
+    };
+    // Registration stays closed until an admin opens it.
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/register",
+          payload: {
+            email: "invited@example.test",
+            password: "InvitedPass-1234",
+            inviteCode: "AAAA-BBBB-CCCC-DDDD",
+          },
+        })
+      ).statusCode,
+      403,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "PUT",
+          url: "/api/invites/registration",
+          headers,
+          payload: { open: true },
+        })
+      ).json().registrationOpen,
+      true,
+    );
+    assert.equal(
+      (await app.inject({ url: "/api/session" })).json().registrationOpen,
+      true,
+    );
+    const limited = (
+      await app.inject({
+        method: "POST",
+        url: "/api/invites",
+        headers,
+        payload: { note: "单次", maxUses: 1, expiresInDays: null },
+      })
+    ).json();
+    assert.match(limited.code, /^[A-Z0-9]{4}(-[A-Z0-9]{4}){3}$/);
+    assert.equal(limited.expiresAt, null, "null days means permanent");
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/register",
+          payload: {
+            email: "one@example.test",
+            password: "InvitedPass-1234",
+            inviteCode: limited.code,
+          },
+        })
+      ).statusCode,
+      200,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/register",
+          payload: {
+            email: "two@example.test",
+            password: "InvitedPass-1234",
+            inviteCode: limited.code,
+          },
+        })
+      ).statusCode,
+      422,
+    );
+    const expired = (
+      await app.inject({
+        method: "POST",
+        url: "/api/invites",
+        headers,
+        payload: { note: "过期", maxUses: 0, expiresInDays: 1 },
+      })
+    ).json();
+    store.db
+      .prepare("UPDATE invites SET expires_at=? WHERE id=?")
+      .run(Date.now() - 1000, expired.id);
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/register",
+          payload: {
+            email: "late@example.test",
+            password: "InvitedPass-1234",
+            inviteCode: expired.code,
+          },
+        })
+      ).statusCode,
+      422,
+    );
+    const unlimited = (
+      await app.inject({
+        method: "POST",
+        url: "/api/invites",
+        headers,
+        payload: { note: "无限", maxUses: 0, expiresInDays: null },
+      })
+    ).json();
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/register",
+          payload: {
+            email: "one@example.test",
+            password: "InvitedPass-1234",
+            inviteCode: unlimited.code,
+          },
+        })
+      ).statusCode,
+      409,
+    );
+    assert.equal(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/register",
+          payload: {
+            email: "three@example.test",
+            password: "short",
+            inviteCode: unlimited.code,
+          },
+        })
+      ).statusCode,
+      422,
+    );
+    const memberLogin = await app.inject({
+      method: "POST",
+      url: "/api/login",
+      payload: { email: "one@example.test", password: "InvitedPass-1234" },
+    });
+    const memberHeaders = {
+      cookie: "azpanel_session=" + memberLogin.cookies[0].value,
+      "x-csrf-token": memberLogin.json().csrf,
+    };
+    assert.equal(
+      (await app.inject({ url: "/api/invites", headers: memberHeaders }))
+        .statusCode,
+      403,
+    );
+    const list = (await app.inject({ url: "/api/invites", headers })).json();
+    assert.equal(list.registrationOpen, true);
+    assert.equal(list.invites.length, 3);
+    assert.equal(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/invites/${unlimited.id}`,
+          headers,
+        })
+      ).statusCode,
+      200,
+    );
+    assert.equal(
+      (await app.inject({ url: "/api/invites", headers })).json().invites
+        .length,
+      2,
+    );
+  } finally {
+    await app.close();
+  }
+});

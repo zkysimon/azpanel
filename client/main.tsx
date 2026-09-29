@@ -69,6 +69,7 @@ import {
   Settings,
   ShieldCheck,
   Sun,
+  Ticket,
   Trash2,
   X,
   Zap,
@@ -76,6 +77,7 @@ import {
 import type {
   Account,
   Audit,
+  Invite,
   Json,
   Location,
   MetricPoint,
@@ -231,15 +233,38 @@ function LoadError({ error }: { error: string }) {
 }
 
 function Login({ onLogin }: { onLogin: (session: Session) => void }) {
-  const [email, setEmail] = useState(""),
+  const [mode, setMode] = useState<"login" | "register">("login"),
+    [email, setEmail] = useState(""),
     [password, setPassword] = useState(""),
+    [repeat, setRepeat] = useState(""),
+    [inviteCode, setInviteCode] = useState(""),
     [error, setError] = useState(""),
-    [busy, setBusy] = useState(false);
+    [notice, setNotice] = useState(""),
+    [busy, setBusy] = useState(false),
+    [registrationOpen, setRegistrationOpen] = useState(false);
+  useEffect(() => {
+    api<Session>("/session")
+      .then((session) => {
+        setCsrf(session.csrf);
+        setRegistrationOpen(session.registrationOpen);
+      })
+      .catch(() => undefined);
+  }, []);
   async function submit(event: React.FormEvent) {
     event.preventDefault();
     setBusy(true);
     setError("");
+    setNotice("");
     try {
+      if (mode === "register") {
+        if (password !== repeat) throw new Error("两次输入的密码不一致");
+        await api("/register", "POST", { email, password, inviteCode });
+        setNotice("注册成功，请使用新账户登录。");
+        setMode("login");
+        setInviteCode("");
+        setRepeat("");
+        return;
+      }
       const session = await api<Session>("/login", "POST", { email, password });
       setCsrf(session.csrf);
       onLogin(session);
@@ -291,12 +316,19 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
       <section className="login-form">
         <form onSubmit={submit}>
           <div className="login-icon">
-            <KeyRound size={28} />
+            {mode === "login" ? <KeyRound size={28} /> : <Ticket size={28} />}
           </div>
-          <Typography variant="h4">欢迎回来</Typography>
-          <p className="muted">登录你的云资源工作空间。</p>
+          <Typography variant="h4">
+            {mode === "login" ? "欢迎回来" : "使用邀请码注册"}
+          </Typography>
+          <p className="muted">
+            {mode === "login"
+              ? "登录你的云资源工作空间。"
+              : "输入管理员提供的邀请码即可创建账户。"}
+          </p>
           <Stack spacing={3} sx={{ mt: 4 }}>
             <LoadError error={error} />
+            {notice && <Alert severity="success">{notice}</Alert>}
             <TextField
               label="邮箱"
               type="email"
@@ -309,10 +341,32 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
               label="密码"
               type="password"
               required
-              autoComplete="current-password"
+              autoComplete={
+                mode === "login" ? "current-password" : "new-password"
+              }
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              helperText={mode === "register" ? "至少 12 位" : undefined}
             />
+            {mode === "register" && (
+              <>
+                <TextField
+                  label="确认密码"
+                  type="password"
+                  required
+                  autoComplete="new-password"
+                  value={repeat}
+                  onChange={(e) => setRepeat(e.target.value)}
+                />
+                <TextField
+                  label="邀请码"
+                  required
+                  value={inviteCode}
+                  onChange={(e) => setInviteCode(e.target.value)}
+                  placeholder="XXXX-XXXX-XXXX-XXXX"
+                />
+              </>
+            )}
             <Button
               type="submit"
               size="large"
@@ -322,11 +376,38 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
                 busy ? <CircularProgress size={18} /> : <ArrowRight size={18} />
               }
             >
-              进入工作空间
+              {mode === "login" ? "进入工作空间" : "创建账户"}
             </Button>
           </Stack>
           <p className="login-help">
-            首次使用？管理员账户在服务启动时通过环境配置创建。
+            {mode === "login"
+              ? registrationOpen
+                ? "有邀请码？"
+                : "注册当前已关闭。"
+              : "注册需要有效的邀请码。"}
+            {mode === "login" && registrationOpen && (
+              <Button
+                size="small"
+                onClick={() => {
+                  setMode("register");
+                  setError("");
+                  setNotice("");
+                }}
+              >
+                使用邀请码注册
+              </Button>
+            )}
+            {mode === "register" && (
+              <Button
+                size="small"
+                onClick={() => {
+                  setMode("login");
+                  setError("");
+                }}
+              >
+                返回登录
+              </Button>
+            )}
           </p>
         </form>
       </section>
@@ -2097,19 +2178,39 @@ function SettingsPage({ session, notify }: PageProps) {
     [email, setEmail] = useState(""),
     [newPassword, setNewPassword] = useState(""),
     [role, setRole] = useState("user"),
-    [busy, setBusy] = useState(false);
+    [busy, setBusy] = useState(false),
+    [invites, setInvites] = useState<Invite[]>([]),
+    [registrationOpen, setRegistrationOpen] = useState(false),
+    [inviteOpen, setInviteOpen] = useState(false),
+    [inviteNote, setInviteNote] = useState(""),
+    [inviteMaxUses, setInviteMaxUses] = useState("0"),
+    [inviteExpiry, setInviteExpiry] = useState("0"),
+    [inviteError, setInviteError] = useState("");
+  const loadInvites = useCallback(async () => {
+    try {
+      const data = await api<{ registrationOpen: boolean; invites: Invite[] }>(
+        "/invites",
+      );
+      setInvites(data.invites);
+      setRegistrationOpen(data.registrationOpen);
+    } catch (e) {
+      notify((e as Error).message);
+    }
+  }, [notify]);
   useEffect(() => {
-    if (session.user?.role === "admin")
+    if (session.user?.role === "admin") {
       void api<User[]>("/users")
         .then(setUsers)
         .catch((e) => notify(e.message));
-  }, []);
+      void loadInvites();
+    }
+  }, [session.user?.role, notify, loadInvites]);
   return (
     <>
       <Heading
         eyebrow="WORKSPACE SETTINGS"
         title="工作空间设置"
-        description="管理登录、安全模式和工作空间成员。"
+        description="管理登录、安全模式、注册邀请和工作空间成员。"
       />
       <div className="settings-grid">
         <Panel title="登录与安全">
@@ -2208,6 +2309,181 @@ function SettingsPage({ session, notify }: PageProps) {
           ))}
         </Panel>
       )}
+      {session.user?.role === "admin" && (
+        <Panel
+          title="注册邀请码"
+          action={
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Chip
+                size="small"
+                color={registrationOpen ? "success" : "default"}
+                label={registrationOpen ? "注册已开放" : "注册已关闭"}
+              />
+              <Button
+                size="small"
+                onClick={async () => {
+                  try {
+                    const result = await api<{ registrationOpen: boolean }>(
+                      "/invites/registration",
+                      "PUT",
+                      { open: !registrationOpen },
+                    );
+                    setRegistrationOpen(result.registrationOpen);
+                  } catch (e) {
+                    notify((e as Error).message);
+                  }
+                }}
+              >
+                {registrationOpen ? "关闭注册" : "开放注册"}
+              </Button>
+              <Button
+                onClick={() => {
+                  setInviteNote("");
+                  setInviteMaxUses("0");
+                  setInviteExpiry("0");
+                  setInviteError("");
+                  setInviteOpen(true);
+                }}
+                startIcon={<Plus size={17} />}
+              >
+                生成邀请码
+              </Button>
+            </Stack>
+          }
+        >
+          {invites.length ? (
+            invites.map((invite) => {
+              const expired =
+                invite.expiresAt !== null && invite.expiresAt < Date.now();
+              const exhausted =
+                invite.maxUses > 0 && invite.uses >= invite.maxUses;
+              return (
+                <div className="resource-line" key={invite.id}>
+                  <Ticket size={20} />
+                  <div className="resource-line-main">
+                    <b className="mono">{invite.code}</b>
+                    <span>
+                      {invite.note || "未备注"} ·{" "}
+                      {invite.maxUses > 0
+                        ? `已用 ${invite.uses}/${invite.maxUses}`
+                        : `已用 ${invite.uses} · 不限次数`}{" "}
+                      ·{" "}
+                      {invite.expiresAt === null
+                        ? "永久有效"
+                        : `至 ${date(invite.expiresAt)}`}
+                    </span>
+                  </div>
+                  <Chip
+                    size="small"
+                    color={expired || exhausted ? "default" : "success"}
+                    label={expired ? "已过期" : exhausted ? "已用尽" : "可用"}
+                  />
+                  <IconButton
+                    aria-label="复制邀请码"
+                    onClick={() =>
+                      void navigator.clipboard
+                        .writeText(invite.code)
+                        .then(() => notify("邀请码已复制"))
+                        .catch(() => notify("复制失败"))
+                    }
+                  >
+                    <Copy size={16} />
+                  </IconButton>
+                  <IconButton
+                    aria-label="删除邀请码"
+                    onClick={async () => {
+                      try {
+                        await api(`/invites/${invite.id}`, "DELETE");
+                        await loadInvites();
+                      } catch (e) {
+                        notify((e as Error).message);
+                      }
+                    }}
+                  >
+                    <Trash2 size={16} />
+                  </IconButton>
+                </div>
+              );
+            })
+          ) : (
+            <Empty
+              title="还没有邀请码"
+              description="生成邀请码并开启注册后，受邀用户可以自行注册账户。"
+            />
+          )}
+        </Panel>
+      )}
+      <Dialog
+        open={inviteOpen}
+        onClose={() => setInviteOpen(false)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>生成邀请码</DialogTitle>
+        <DialogContent>
+          <Stack spacing={3} sx={{ pt: 1 }}>
+            <LoadError error={inviteError} />
+            <TextField
+              label="备注（选填）"
+              value={inviteNote}
+              onChange={(e) => setInviteNote(e.target.value)}
+              helperText="例如：给朋友 A"
+            />
+            <TextField
+              label="使用次数上限"
+              type="number"
+              value={inviteMaxUses}
+              onChange={(e) => setInviteMaxUses(e.target.value)}
+              helperText="0 表示不限次数"
+            />
+            <TextField
+              label="有效期"
+              select
+              value={inviteExpiry}
+              onChange={(e) => setInviteExpiry(e.target.value)}
+            >
+              <MenuItem value="0">永久有效</MenuItem>
+              <MenuItem value="1">1 天</MenuItem>
+              <MenuItem value="7">7 天</MenuItem>
+              <MenuItem value="30">30 天</MenuItem>
+              <MenuItem value="90">90 天</MenuItem>
+            </TextField>
+            <Alert severity="info">
+              邀请码格式如 <code>ABCD-EFGH-JKLM-NPQR</code>
+              ，可复制发给用户。注册需在管理员开启后方可进行。
+            </Alert>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setInviteOpen(false)}>取消</Button>
+          <Button
+            variant="contained"
+            onClick={async () => {
+              setInviteError("");
+              const maxUses = Number(inviteMaxUses);
+              const days = Number(inviteExpiry);
+              if (!Number.isInteger(maxUses) || maxUses < 0) {
+                setInviteError("使用次数必须是不小于 0 的整数");
+                return;
+              }
+              try {
+                await api("/invites", "POST", {
+                  note: inviteNote,
+                  maxUses,
+                  expiresInDays: days === 0 ? null : days,
+                });
+                setInviteOpen(false);
+                await loadInvites();
+                notify("邀请码已生成");
+              } catch (e) {
+                setInviteError((e as Error).message);
+              }
+            }}
+          >
+            生成
+          </Button>
+        </DialogActions>
+      </Dialog>
       <Dialog
         open={open}
         onClose={() => setOpen(false)}

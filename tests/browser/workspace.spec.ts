@@ -175,3 +175,37 @@ test("login, navigation, MD3 theme, resource details, quota and mobile layout", 
   await expect(page.getByText("欢迎回来")).toBeVisible();
   expect(errors).toEqual([]);
 });
+
+test("register with an invite code and sign in", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto("/");
+  await expect(page.getByText("欢迎回来")).toBeVisible();
+  await page.getByRole("button", { name: "使用邀请码注册" }).click();
+  await expect(
+    page.getByRole("heading", { name: "使用邀请码注册" }),
+  ).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "邮箱", exact: true })
+    .fill("brand-new@example.test");
+  await page
+    .getByRole("textbox", { name: "密码", exact: true })
+    .fill("BrowserPass-1234");
+  await page
+    .getByRole("textbox", { name: "确认密码" })
+    .fill("BrowserPass-1234");
+  await page.getByRole("textbox", { name: "邀请码" }).fill("WRONG-CODE-0000");
+  await page.getByRole("button", { name: "创建账户" }).click();
+  await expect(page.getByText("邀请码无效")).toBeVisible();
+  await page.getByRole("textbox", { name: "邀请码" }).fill("TEST-CODE-0001");
+  await page.getByRole("button", { name: "创建账户" }).click();
+  await expect(page.getByText("注册成功", { exact: false })).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "密码", exact: true })
+    .fill("BrowserPass-1234");
+  await page.getByRole("button", { name: "进入工作空间" }).click();
+  await expect(
+    page.getByRole("heading", { name: "一切，尽在掌握。" }),
+  ).toBeVisible();
+  expect(errors).toEqual([]);
+});

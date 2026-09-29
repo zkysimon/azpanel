@@ -103,3 +103,17 @@ export const presetSchema = z.object({
   isDefault: z.boolean().default(false),
 });
 export type VmPresetInput = z.infer<typeof presetSchema>;
+
+export const inviteSchema = z.object({
+  note: z.string().trim().max(80).default(""),
+  maxUses: z.number().int().min(0).max(100000).default(0),
+  expiresInDays: z.number().int().min(1).max(3650).nullable().default(null),
+});
+export type InviteInput = z.infer<typeof inviteSchema>;
+
+export const passwordSchema = z.string().min(12).max(256);
+export const registerSchema = z.object({
+  email: z.string().email().toLowerCase(),
+  password: passwordSchema,
+  inviteCode: z.string().trim().min(4).max(64),
+});
