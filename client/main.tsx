@@ -430,7 +430,7 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
 }
 
 interface PageProps {
-  navigate: (page: Page) => void;
+  navigate: (page: Page, params?: Record<string, string>) => void;
   notify: (message: string) => void;
   session: Session;
   revision: number;
@@ -983,6 +983,34 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
     [size, setSize] = useState(""),
     [disk, setDisk] = useState(64),
     [details, setDetails] = useState<VirtualMachine | null>(null);
+  const requestedMachine = useMemo(() => {
+    const params = new URLSearchParams(location.hash.split("?")[1] ?? "");
+    return {
+      accountId: params.get("account"),
+      name: params.get("name"),
+      group: params.get("group"),
+    };
+  }, []);
+  useEffect(() => {
+    if (
+      !data ||
+      !requestedMachine.accountId ||
+      !requestedMachine.name ||
+      !requestedMachine.group
+    )
+      return;
+    // Resolve only within the submitted account and resource group. Different
+    // subscriptions may contain VMs with the same name.
+    const vm = data.find(
+      (item) =>
+        item.accountId === requestedMachine.accountId &&
+        item.name.toLowerCase() === requestedMachine.name!.toLowerCase() &&
+        item.resourceGroup.toLowerCase() ===
+          requestedMachine.group!.toLowerCase(),
+    );
+    if (vm) setDetails(vm);
+    else notify("创建已完成，但列表中尚未找到对应虚拟机，请刷新资源列表");
+  }, [data, requestedMachine, notify]);
   const actionNames: Record<string, string> = {
     start: "启动虚拟机",
     powerOff: "关机（保留计算分配）",
@@ -1282,7 +1310,7 @@ function MachineDetails({
   );
 }
 
-function CreatePage({ session, notify }: PageProps) {
+function CreatePage({ session, notify, navigate }: PageProps) {
   const { data: accounts } = useLoad(() => api<Account[]>("/accounts"), []);
   const [accountId, setAccountId] = useState(""),
     [skus, setSkus] = useState<Sku[]>([]),
@@ -1319,9 +1347,14 @@ function CreatePage({ session, notify }: PageProps) {
     confirmation: "",
   });
   const busy = loadingLocations || loadingImages || loadingSkus;
-  const operation = useInlineTask((task) => {
-    if (task.status === "succeeded")
-      notify("虚拟机创建完成，资源已同步；当前配置已保留");
+  const operation = useInlineTask((task, job) => {
+    if (task.status !== "succeeded") return;
+    notify("虚拟机创建完成，已进入管理页面");
+    navigate("machines", {
+      account: job.accountId,
+      name: job.target,
+      group: `${job.target}-azpanel`,
+    });
   });
   const field = <K extends keyof CreateVm>(key: K, value: CreateVm[K]) =>
     setForm((old) => ({ ...old, [key]: value }));
@@ -1883,7 +1916,7 @@ function CreatePage({ session, notify }: PageProps) {
                 {busy ? "处理中…" : "创建虚拟机"}
               </Button>
               <p className="page-note">
-                创建后留在当前页面显示进度，成功后自动同步资源；任务中心也会保留记录。
+                创建中留在当前页显示进度；创建并同步成功后自动进入虚拟机管理详情，失败则保留当前配置。
               </p>
             </Paper>
           </aside>
@@ -2999,7 +3032,7 @@ function App() {
     [ready, setReady] = useState(false),
     [startupError, setStartupError] = useState(""),
     [page, setPage] = useState<Page>(
-      (location.hash.slice(1) || "overview") as Page,
+      (location.hash.slice(1).split("?")[0] || "overview") as Page,
     ),
     [mobile, setMobile] = useState(false),
     [toast, setToast] = useState(""),
@@ -3013,8 +3046,9 @@ function App() {
   });
   const theme = useMemo(() => makeTheme(dark), [dark]);
   const notify = useCallback((message: string) => setToast(message), []);
-  const navigate = (next: Page) => {
-    location.hash = next;
+  const navigate = (next: Page, params?: Record<string, string>) => {
+    location.hash =
+      next + (params ? "?" + new URLSearchParams(params).toString() : "");
     setPage(next);
     setMobile(false);
     setRevision((value) => value + 1);
@@ -3028,7 +3062,7 @@ function App() {
       .catch((e) => setStartupError(e.message))
       .finally(() => setReady(true));
     const listener = () =>
-      setPage((location.hash.slice(1) || "overview") as Page);
+      setPage((location.hash.slice(1).split("?")[0] || "overview") as Page);
     window.addEventListener("hashchange", listener);
     return () => window.removeEventListener("hashchange", listener);
   }, []);

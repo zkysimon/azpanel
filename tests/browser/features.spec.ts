@@ -109,7 +109,8 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   ).toContainText("容量不符合", { timeout: 15000 });
   expect(new URL(page.url()).hash).toBe("#ai");
 
-  // VM creation uses a grouped physical region dropdown and stays on the wizard.
+  // Stay on the wizard while running, then open the submitted VM's management
+  // details only after the task (including resource sync) succeeds.
   await page
     .locator("nav")
     .getByRole("button", { name: "虚拟机", exact: true })
@@ -146,15 +147,60 @@ test("mobile members, credit card, multi-delete and AI deployments work together
     .fill("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ== test@example");
   await page.getByLabel("允许管理访问的来源 CIDR").fill("192.0.2.1/32");
   await page.getByLabel("再次输入虚拟机名称确认").fill("browser-vm");
+  let releaseTask: () => void = () => {};
+  const taskGate = new Promise<void>((resolve) => {
+    releaseTask = resolve;
+  });
+  await page.route("**/api/tasks/*", async (route) => {
+    await taskGate;
+    await route.continue();
+  });
   await page.getByRole("button", { name: "创建虚拟机", exact: true }).click();
   await expect(
     page.getByRole("region", { name: "当前操作进度" }),
-  ).toContainText("已完成", { timeout: 15000 });
+  ).toContainText("browser-vm");
   await expect(
     page.getByRole("heading", { name: "创建虚拟机", exact: true }),
   ).toBeVisible();
   expect(new URL(page.url()).hash).toBe("#create");
-  await expect(region).toContainText("Japan East");
+  // Editing while waiting must not change the target that the success callback opens.
+  await page
+    .getByRole("textbox", { name: "虚拟机名称", exact: true })
+    .fill("edited-after-submit");
+  releaseTask();
+  await expect(
+    page.getByRole("heading", { name: "虚拟机", exact: true }),
+  ).toBeVisible({ timeout: 15000 });
+  const detail = page.getByRole("dialog");
+  await expect(detail.getByText("browser-vm", { exact: true })).toBeVisible();
+  await expect(detail.getByText("japaneast", { exact: true })).toBeVisible();
+  const destination = new URLSearchParams(
+    new URL(page.url()).hash.split("?")[1],
+  );
+  expect(destination.get("name")).toBe("browser-vm");
+  expect(destination.get("group")).toBe("browser-vm-azpanel");
+  await detail.getByRole("button", { name: "关闭详情" }).click();
+
+  // A failed creation remains in the wizard with its entered values.
+  await page.getByRole("button", { name: "创建虚拟机", exact: true }).click();
+  await expect(page.getByRole("combobox", { name: "系统镜像" })).toBeEnabled();
+  await page
+    .getByRole("textbox", { name: "虚拟机名称", exact: true })
+    .fill("failed-browser-vm");
+  await page.getByLabel("虚拟机规格").fill("Standard_NotAvailable");
+  await page
+    .getByLabel("RSA SSH 公钥")
+    .fill("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ== test@example");
+  await page.getByLabel("允许管理访问的来源 CIDR").fill("192.0.2.1/32");
+  await page.getByLabel("再次输入虚拟机名称确认").fill("failed-browser-vm");
+  await page.getByRole("button", { name: "创建虚拟机", exact: true }).click();
+  await expect(
+    page.getByRole("region", { name: "当前操作进度" }),
+  ).toContainText("所选规格不可用", { timeout: 15000 });
+  expect(new URL(page.url()).hash).toBe("#create");
+  await expect(
+    page.getByRole("textbox", { name: "虚拟机名称", exact: true }),
+  ).toHaveValue("failed-browser-vm");
 
   await page
     .locator("nav")

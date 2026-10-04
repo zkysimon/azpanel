@@ -6,6 +6,7 @@ import { account, credentials, machine, testConfig } from "./fixtures.js";
 
 const aiRoot = `/subscriptions/${account.subscriptionId}/resourceGroups/ai-group/providers/Microsoft.CognitiveServices/accounts/test-ai`;
 const aiDeployments: Record<string, any> = {};
+const vmDeployments: Record<string, any> = {};
 
 const store = new Store(testConfig, true);
 const admin = store.db.prepare("SELECT id FROM users LIMIT 1").get() as {
@@ -45,6 +46,36 @@ const azure = new Azure(
   new RequestGate(0),
   async (url, options) => {
     const path = new URL(String(url)).pathname;
+    if (path.endsWith("/virtualMachines"))
+      return Response.json({ value: Object.values(vmDeployments) });
+    if (path.endsWith("/instanceView"))
+      return Response.json({ statuses: [{ code: "PowerState/running" }] });
+    if (
+      path.endsWith("/providers/Microsoft.Resources/deployments/azpanel") &&
+      options?.method === "PUT"
+    ) {
+      const body = JSON.parse(String(options.body));
+      const vm = body.properties.template.resources.find(
+        (item: any) => item.type === "Microsoft.Compute/virtualMachines",
+      );
+      const id =
+        path.split("/providers/")[0] +
+        "/providers/Microsoft.Compute/virtualMachines/" +
+        vm.name;
+      vmDeployments[id] = {
+        ...vm,
+        id,
+        properties: {
+          ...vm.properties,
+          provisioningState: "Succeeded",
+          networkProfile: { networkInterfaces: [] },
+          storageProfile: {
+            ...vm.properties.storageProfile,
+            osDisk: { ...vm.properties.storageProfile.osDisk, osType: "Linux" },
+          },
+        },
+      };
+    }
     if (path.endsWith("/versions"))
       return Response.json([{ name: "24.04.202609040" }]);
     if (path.endsWith("/versions/24.04.202609040"))

@@ -149,7 +149,7 @@ docker compose up -d --build
 
 镜像 SKU 和版本目录 API 返回裸数组。创建前通过 `/skus/{sku}/versions` 解析 `latest`，再读取 `/versions/{version}` 检查真实元数据，将解析后的具体版本提交部署。不会再请求无效的 `/skus/{sku}` GET，也不会将目录读取失败伪装成固定镜像列表。
 
-创建虚拟机后留在创建页显示进度、成功或失败原因，保留已填配置，成功后后台同步资源；不自动跳转任务中心。
+创建虚拟机时留在创建页显示进度，创建并同步成功后自动进入虚拟机管理页并打开新机器详情；失败时留在创建页显示原因并保留配置。跳转使用提交时的账户、资源组和名称定位，不受等待期间表单修改影响，也不跳转任务中心。
 
 可用 `AZURE_CREDENTIALS_JSON` 环境变量运行 `npx tsx tools/check-image.ts` 只读核验区域、镜像目录和版本详情。`--reproduce-old-url` 可复现旧接口错误。此次只读联调已复现 `The request URL is not valid.` 并验证修正后的路径；未重新创建收费虚拟机。
 
