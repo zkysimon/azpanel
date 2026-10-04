@@ -37,11 +37,47 @@ test("database restart retains encrypted accounts, marks jobs interrupted, and r
         Date.now(),
         Date.now(),
       );
+    store.db
+      .prepare("INSERT INTO task_results VALUES(?,?)")
+      .run(
+        "interrupted-task",
+        JSON.stringify([{ name: "empty-group", status: "succeeded" }]),
+      );
+    store.db
+      .prepare("INSERT INTO billing_cache VALUES(?,?,?)")
+      .run(
+        account.id,
+        JSON.stringify({ checkedAt: 123, credit: { remaining: null } }),
+        Date.now() + 900000,
+      );
     store.close();
     store = new Store(config);
     assert.deepEqual(store.credentials(user.id, account.id), credentials);
     assert.equal(store.tasks(user.id)[0].status, "interrupted");
     assert.equal(store.accounts(user.id).length, 1);
+    assert.deepEqual(store.tasks(user.id)[0].results, [
+      { name: "empty-group", status: "succeeded" },
+    ]);
+    assert.ok(
+      store.db
+        .prepare("SELECT data FROM billing_cache WHERE account_id=?")
+        .get(account.id),
+    );
+    assert.equal(
+      (
+        store.db.prepare("PRAGMA user_version").get() as {
+          user_version: number;
+        }
+      ).user_version,
+      5,
+    );
+    store.db.prepare("DELETE FROM accounts WHERE id=?").run(account.id);
+    assert.equal(
+      store.db
+        .prepare("SELECT data FROM billing_cache WHERE account_id=?")
+        .get(account.id),
+      undefined,
+    );
   } finally {
     store.close();
     rmSync(dataDir, { recursive: true, force: true });

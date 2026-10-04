@@ -115,12 +115,42 @@ docker compose up -d --build
 | 创建网络 | Standard 静态 IPv4 / IPv6、NSG、VNet、NIC、ARM 部署依赖 |
 | 系统镜像 | 区域与镜像均从 Azure 实时读取（区域缓存 1 小时、镜像缓存 24 小时），Gen2 x64 过滤；覆盖 Ubuntu、Debian、AlmaLinux、Rocky Linux、Oracle Linux 与 Windows Server |
 | 访问控制 | RSA SSH 公钥或密码；指定管理来源 CIDR，仅开放 SSH / RDP |
-| 资源组 | 查询、浏览、删除（明确确认，删除组内所有资源） |
+| 资源组 | 查询、浏览、单个或多选删除空资源组；非空立即返回资源名称与类型，逐项记录结果 |
+| AI 模型管理 | Azure OpenAI / AI Services 资源创建、模型目录、部署类型与容量选择、创建和删除模型部署 |
+| 订阅额度 | 每个账户显示 Azure 返回的额度、余额范围和本月实际费用；权限不足或接口不支持时明确标注 |
 | 规格 / 配额 / 监控 | 按需读取；CPU、网络入站和出站 |
 | 预设配置 | 保存常用区域、镜像、规格、系统盘、登录方式与网络设置；一键套用，可设为默认自动加载；含密码时加密存储 |
 | 后台任务 / 审计 | 持久化进度、失败信息、重启中断标记 |
 
-**语义说明**：关机 `powerOff` 仍保留分配；`deallocate` 释放计算资源，磁盘与公网 IP 仍可能计费。删除现有 VM 是否自动删除磁盘 / 网卡取决于其 Azure `deleteOption`。新版新建 VM 设置为 Detach；要清理整个部署，请确认后删除对应资源组。系统盘扩容前需停止并释放，扩容后需在操作系统内扩展分区。
+**语义说明**：关机 `powerOff` 仍保留分配；`deallocate` 释放计算资源，磁盘与公网 IP 仍可能计费。删除现有 VM 是否自动删除磁盘 / 网卡取决于其 Azure `deleteOption`。新版新建 VM 设置为 Detach；删除 VM 后需在 Azure Portal 清理保留的磁盘、网卡、公网 IP 等，再删除空资源组。系统盘扩容前需停止并释放，扩容后需在操作系统内扩展分区。
+
+## 多选删除与移动端
+
+资源浏览器中勾选需要删除的资源组，点击「删除所选资源组」，输入 `DELETE` 确认。每次最多 50 组，同名重复项会被拒绝。非空组在预检查后立即报告组内资源名称/类型，不提交 Azure 删除；空组进入串行任务队列，真正执行前再检查一次。任务中心显示每组成功或失败原因，某组失败不阻止其他空组删除。
+
+这项检查不会自动删除组内资源。Azure 的列表检查和删除不是一个原子操作，删除期间请勿在其他客户端向目标空组新建资源。此前实测记录描述的是当时版本的行为，当前网页/API 仅删除空组。
+
+成员列表在窄屏上将邮箱、角色状态、操作按钮分行显示，长邮箱省略展示，避免被按钮挤成竖排。
+
+## AI 模型管理
+
+1. 打开「AI 模型」，选择自己的 Azure 账户。
+2. 选择已有 Azure OpenAI / AI Services 资源；没有时可点「创建 AI 服务」，在已有资源组中选择区域和服务类型（S0）。订阅需已注册 `Microsoft.CognitiveServices`。
+3. 面板从该服务的 `/models` 接口读取模型版本、部署类型及容量范围，目录缓存 1 小时。创建时重新校验版本和容量，不覆盖同名部署。
+4. 点击「部署模型」，选择模型、版本、部署类型和容量，输入部署名称确认。任务中心显示部署状态。
+5. 删除模型部署只删除对应 `deployments/{name}`，保留 AI 服务资源。删除后该部署不可继续调用。
+
+模型可用性、订阅权限、区域和配额以 Azure 返回为准。容量单位与 TPM 的换算因模型而异；预置吞吐部署可能产生持续费用。面板不自动调用模型、不读取或展示 API 密钥；不支持 Azure ML 托管终结点和第三方服务器的模型部署。AI 部署与删除受 `AZURE_ALLOW_WRITES` 控制，按用户隔离。
+
+## 额度与费用说明
+
+- 进入云账户页会加载每个账号的账单摘要；正常结果持久化缓存 **15 分钟**，临时错误缓存 1 分钟。不会因普通页面刷新持续调用 Azure。
+- 额度总额来自 Billing Property 的活动 spending limit；余额来自 Consumption Credit Summary。两者若属于 **账单配置文件共享额度**，页面会明确标注，不能当作某个订阅的独立余额。
+- 本月费用来自 Cost Management 的 **MonthToDate / ActualCost / PreTaxCost**，展示 Azure 返回的币种，数据可能延迟。它不是累计已扣赠送额度，也不会用「总额减本月费用」计算余额。
+- 部分学生/赞助订阅没有可用的服务主体余额 API；会显示「未提供」及原因，不能将它解读为余额为 0。账单读取需要对应 Billing / Cost Management 权限，Azure 资源 Contributor 不一定拥有这些权限。
+- 账单读取失败不影响资源同步。不同用户无法访问对方的账单摘要或 AI 部署。
+
+本次新增功能通过模拟 ARM 的接口测试及浏览器回归验证，未在真实订阅创建付费 AI 部署。接口依据：[AI 模型目录](https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement/accounts/list-models?view=rest-aiservices-accountmanagement-2024-10-01)、[AI 部署](https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement/deployments/create-or-update?view=rest-aiservices-accountmanagement-2024-10-01)、[Billing Property](https://learn.microsoft.com/en-us/rest/api/billing/billing-property/get?view=rest-billing-2024-04-01)、[Credit Summary](https://learn.microsoft.com/en-us/rest/api/consumption/credits/get?view=rest-consumption-2024-08-01)。
 
 ### 功能范围
 
@@ -163,7 +193,7 @@ npm run check:azure -- --inventory
 npx tsx tools/live-lifecycle.ts --preflight
 ```
 
-只有显式设置 `AZURE_LIVE_CONFIRM=create-manage-delete` 才允许创建临时资源；可通过 `AZURE_TEST_REGION` 指定区域，默认为 `eastasia`。脚本的传输层将所有写操作限制到本次随机命名的 `azptest-*` 资源组，并在 finally 中尝试删除。若清理输出 `CLEANUP_FAILURE`，须检查云端实际状态，不能将超时理解为资源已不存在。
+只有显式设置 `AZURE_LIVE_CONFIRM=create-manage-delete` 才允许创建临时资源；可通过 `AZURE_TEST_REGION` 指定区域，默认为 `eastasia`。脚本的传输层将所有写操作限制到本次随机命名的 `azptest-*` 资源组，并在 finally 中直接调用 ARM 清理这个专用测试组（包含其临时资源），不通过只允许删除空组的网页接口。若清理输出 `CLEANUP_FAILURE`，须检查云端实际状态，不能将超时理解为资源已不存在。
 
 详细实测记录见 [docs/live-test-2026-09-28.md](docs/live-test-2026-09-28.md)。
 

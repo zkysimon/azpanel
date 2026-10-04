@@ -50,6 +50,16 @@ export interface Task {
   error: string | null;
   createdAt: number;
   updatedAt: number;
+  results?: TaskItemResult[];
+}
+export interface TaskItemResult {
+  name: string;
+  status: "queued" | "succeeded" | "failed";
+  message?: string;
+}
+export interface BatchDeleteResponse {
+  taskId: string | null;
+  results: TaskItemResult[];
 }
 export interface User {
   id: string;

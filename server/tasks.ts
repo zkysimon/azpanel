@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AppError, Store } from "./store.js";
+import type { TaskItemResult } from "../shared/types.js";
 
 export class Tasks {
   private tail: Promise<unknown> = Promise.resolve();
@@ -10,7 +11,9 @@ export class Tasks {
     accountId: string,
     kind: string,
     target: string,
-    work: (progress: (message: string) => void) => Promise<void>,
+    work: (
+      progress: (message: string) => void,
+    ) => Promise<void | TaskItemResult[]>,
   ) {
     if (this.pending >= 20)
       throw new AppError(429, "后台任务队列已满，请稍后再试");
@@ -47,7 +50,20 @@ export class Tasks {
         .prepare("UPDATE tasks SET status='running', updated_at=? WHERE id=?")
         .run(Date.now(), id);
       try {
-        await work(progress);
+        const results = await work(progress);
+        if (results) {
+          this.store.db
+            .prepare(
+              "INSERT OR REPLACE INTO task_results(task_id,data) VALUES(?,?)",
+            )
+            .run(id, JSON.stringify(results));
+          const failed = results.filter((result) => result.status === "failed");
+          if (failed.length)
+            throw new AppError(
+              502,
+              `${results.length - failed.length} 项成功，${failed.length} 项失败，请查看逐项结果`,
+            );
+        }
         this.store.db
           .prepare(
             "UPDATE tasks SET status='succeeded', progress='已完成', updated_at=? WHERE id=?",

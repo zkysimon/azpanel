@@ -27,7 +27,7 @@ const resources = "2021-04-01";
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 type Transport = typeof fetch;
 type TokenProvider = (credentials: Credentials) => Promise<string>;
-class AzureError extends AppError {
+export class AzureError extends AppError {
   constructor(
     readonly azureStatus: number,
     message: string,
@@ -321,7 +321,10 @@ export class Azure {
       "/subscriptions?api-version=2022-12-01",
     )) as Subscription[];
   }
-  private async cached<T>(
+  invalidateCache(key: string) {
+    this.cache.delete(key);
+  }
+  async cached<T>(
     key: string,
     ttl: number,
     load: () => Promise<T>,
@@ -492,6 +495,46 @@ export class Azure {
     return this.list(
       credentials,
       `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(group)}/resources?api-version=${resources}`,
+    );
+  }
+  /** Uncached first page: enough to refuse a non-empty group without enumerating it. */
+  async assertGroupEmpty(
+    credentials: Credentials,
+    account: Account,
+    group: string,
+  ) {
+    const { data } = await this.request(
+      credentials,
+      "GET",
+      `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(group)}/resources?api-version=${resources}&$top=5`,
+    );
+    if (!Array.isArray(data.value))
+      throw new AppError(502, "无法确认资源组是否为空，已取消删除");
+    if (data.value.length || data.nextLink) {
+      const examples = data.value
+        .slice(0, 5)
+        .map((item: Json) => `${item.name}（${item.type}）`)
+        .join("、");
+      throw new AppError(
+        409,
+        `资源组 ${group} 非空，仍包含${examples || "其他资源"}${data.nextLink ? "等资源" : ""}。请先删除或迁移组内资源。`,
+      );
+    }
+  }
+  async deleteEmptyGroup(
+    credentials: Credentials,
+    account: Account,
+    group: string,
+    progress?: (message: string) => void,
+  ) {
+    // Check again when the queued task starts; never rely on a cached preflight.
+    await this.assertGroupEmpty(credentials, account, group);
+    await this.operation(
+      credentials,
+      "DELETE",
+      `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(group)}?api-version=${resources}`,
+      undefined,
+      progress,
     );
   }
   async machines(

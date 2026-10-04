@@ -12,6 +12,7 @@ import type {
   Invite,
   User,
   VmPreset,
+  TaskItemResult,
 } from "../shared/types.js";
 import {
   accountSchema,
@@ -29,6 +30,15 @@ import type { Config } from "./config.js";
 import { Azure, RequestGate, selectSubscription } from "./azure.js";
 import { fallbackImages } from "../shared/images.js";
 import { Tasks } from "./tasks.js";
+import { AzureAi } from "./azure-ai.js";
+import { AzureBilling } from "./azure-billing.js";
+import type { BillingSummary } from "../shared/billing.js";
+import {
+  aiServiceSchema,
+  aiCreateServiceSchema,
+  aiDeploySchema,
+  aiDeleteSchema,
+} from "../shared/ai.js";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -46,6 +56,9 @@ export async function buildApp(
   const azure =
     supplied?.azure ?? new Azure(new RequestGate(config.azureInterval));
   const tasks = new Tasks(store);
+  const ai = new AzureAi(azure);
+  const billing = new AzureBilling(azure);
+  const billingLoads = new Map<string, Promise<BillingSummary>>();
   const app = Fastify({ logger: false, bodyLimit: 100_000, trustProxy: false });
   app.decorateRequest("currentUser", null);
   app.decorateRequest("csrf", "");
@@ -334,6 +347,9 @@ export async function buildApp(
       account.state = subscription.state;
       account.subscriptions = subscriptions;
       account.error = null;
+      store.db
+        .prepare("DELETE FROM billing_cache WHERE account_id=?")
+        .run(account.id);
     }
     account.label = input.label;
     store.saveAccount(user(request).id, account, credentials);
@@ -375,6 +391,38 @@ export async function buildApp(
     const { account, credentials } = accountContext(request);
     return azure.locations(credentials, account);
   });
+  app.get("/api/accounts/:id/billing", async (request) => {
+    const { account, credentials } = accountContext(request);
+    const cached = store.db
+      .prepare("SELECT data,expires_at FROM billing_cache WHERE account_id=?")
+      .get(account.id) as { data: string; expires_at: number } | undefined;
+    if (cached && cached.expires_at > Date.now())
+      return JSON.parse(cached.data) as BillingSummary;
+    const pending = billingLoads.get(account.id);
+    if (pending) return pending;
+    const load = billing
+      .summary(credentials, account)
+      .then((summary) => {
+        if (
+          store.db
+            .prepare("SELECT id FROM accounts WHERE id=? AND user_id=?")
+            .get(account.id, user(request).id)
+        ) {
+          const ttl =
+            summary.credit.status === "error" ||
+            summary.spending.status === "error"
+              ? 60000
+              : 900000;
+          store.db
+            .prepare("INSERT OR REPLACE INTO billing_cache VALUES(?,?,?)")
+            .run(account.id, JSON.stringify(summary), Date.now() + ttl);
+        }
+        return summary;
+      })
+      .finally(() => billingLoads.delete(account.id));
+    billingLoads.set(account.id, load);
+    return load;
+  });
   app.get("/api/accounts/:id/images", async (request) => {
     const { account, credentials } = accountContext(request);
     const { region } = z.object({ region: regionSchema }).parse(request.query);
@@ -394,6 +442,85 @@ export async function buildApp(
     const { account, credentials } = accountContext(request);
     const { region } = z.object({ region: regionSchema }).parse(request.query);
     return azure.quotas(credentials, account, region);
+  });
+  app.get("/api/accounts/:id/ai/services", async (request) => {
+    const { account, credentials } = accountContext(request);
+    return ai.services(credentials, account);
+  });
+  app.post("/api/accounts/:id/ai/services", async (request) => {
+    checkWrites();
+    const { account, credentials } = accountContext(request);
+    const input = aiCreateServiceSchema.parse(request.body);
+    if (account.state !== "Enabled") throw new AppError(422, "当前订阅不可用");
+    return {
+      taskId: tasks.enqueue(
+        user(request).id,
+        account.id,
+        "创建 AI 服务",
+        input.name,
+        (progress) => ai.createService(credentials, account, input, progress),
+      ),
+    };
+  });
+  app.get("/api/accounts/:id/ai/models", async (request) => {
+    const { account, credentials } = accountContext(request);
+    return ai.models(
+      credentials,
+      account,
+      aiServiceSchema.parse(request.query),
+    );
+  });
+  app.get("/api/accounts/:id/ai/deployments", async (request) => {
+    const { account, credentials } = accountContext(request);
+    return ai.deployments(
+      credentials,
+      account,
+      aiServiceSchema.parse(request.query),
+    );
+  });
+  app.get("/api/accounts/:id/ai/usages", async (request) => {
+    const { account, credentials } = accountContext(request);
+    return ai.usages(
+      credentials,
+      account,
+      aiServiceSchema.parse(request.query),
+    );
+  });
+  app.post("/api/accounts/:id/ai/deployments", async (request) => {
+    checkWrites();
+    const { account, credentials } = accountContext(request);
+    const input = aiDeploySchema.parse(request.body);
+    if (account.state !== "Enabled") throw new AppError(422, "当前订阅不可用");
+    return {
+      taskId: tasks.enqueue(
+        user(request).id,
+        account.id,
+        "部署 AI 模型",
+        input.deployment,
+        (progress) => ai.deploy(credentials, account, input, progress),
+      ),
+    };
+  });
+  app.delete("/api/accounts/:id/ai/deployments", async (request) => {
+    checkWrites();
+    const { account, credentials } = accountContext(request);
+    const input = aiDeleteSchema.parse(request.body);
+    return {
+      taskId: tasks.enqueue(
+        user(request).id,
+        account.id,
+        "删除 AI 部署",
+        input.deployment,
+        (progress) =>
+          ai.deleteDeployment(
+            credentials,
+            account,
+            input,
+            input.deployment,
+            progress,
+          ),
+      ),
+    };
   });
   app.get("/api/accounts/:id/groups", async (request) => {
     const { account, credentials } = accountContext(request);
@@ -416,6 +543,7 @@ export async function buildApp(
       })
       .parse(request.body);
     confirm(input.confirmation, input.group);
+    await azure.assertGroupEmpty(credentials, account, input.group);
     return {
       taskId: tasks.enqueue(
         user(request).id,
@@ -423,17 +551,98 @@ export async function buildApp(
         "删除资源组",
         input.group,
         async (progress) => {
-          await azure.operation(
+          await azure.deleteEmptyGroup(
             credentials,
-            "DELETE",
-            `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(input.group)}?api-version=2021-04-01`,
-            undefined,
+            account,
+            input.group,
             progress,
           );
-          await sync(user(request).id, account, credentials, progress);
         },
       ),
     };
+  });
+  app.post("/api/accounts/:id/groups/delete-batch", async (request) => {
+    checkWrites();
+    const { account, credentials } = accountContext(request);
+    const { groups, confirmation } = z
+      .object({
+        groups: z
+          .array(z.string().regex(/^[\w.()-]{1,90}$/))
+          .min(1)
+          .max(50)
+          .refine(
+            (items) =>
+              new Set(items.map((item) => item.toLowerCase())).size ===
+              items.length,
+            "资源组不能重复",
+          ),
+        confirmation: z.literal("DELETE"),
+      })
+      .parse(request.body);
+    confirm(confirmation, "DELETE");
+    if (
+      store
+        .tasks(user(request).id)
+        .some(
+          (task) =>
+            task.accountId === account.id &&
+            ["queued", "running"].includes(task.status),
+        )
+    ) {
+      throw new AppError(409, "该账户已有任务正在执行，请等待完成");
+    }
+    const results: TaskItemResult[] = [];
+    for (const group of groups) {
+      try {
+        await azure.assertGroupEmpty(credentials, account, group);
+        results.push({ name: group, status: "queued" });
+      } catch (error) {
+        results.push({
+          name: group,
+          status: "failed",
+          message:
+            error instanceof AppError
+              ? error.message
+              : "检查资源组失败，已跳过删除",
+        });
+      }
+    }
+    const eligible = results.filter((result) => result.status === "queued");
+    if (!eligible.length) return { taskId: null, results };
+    const taskId = tasks.enqueue(
+      user(request).id,
+      account.id,
+      "批量删除空资源组",
+      `${eligible.length} 个资源组`,
+      async (progress) => {
+        const completed: TaskItemResult[] = results.filter(
+          (result) => result.status === "failed",
+        );
+        for (const item of eligible) {
+          progress(`正在删除 ${item.name}`);
+          try {
+            await azure.deleteEmptyGroup(
+              credentials,
+              account,
+              item.name,
+              progress,
+            );
+            completed.push({ name: item.name, status: "succeeded" });
+          } catch (error) {
+            completed.push({
+              name: item.name,
+              status: "failed",
+              message:
+                error instanceof AppError
+                  ? error.message
+                  : "删除失败，请刷新 Azure 资源状态",
+            });
+          }
+        }
+        return completed;
+      },
+    );
+    return { taskId, results };
   });
   app.get("/api/machines", async (request) => store.machines(user(request).id));
   app.get("/api/machines/:id", async (request) =>
@@ -696,6 +905,7 @@ export async function buildApp(
   }
   app.addHook("onClose", async () => {
     await tasks.idle();
+    await Promise.allSettled(billingLoads.values());
     store.close();
   });
   return { app, store, azure, tasks };

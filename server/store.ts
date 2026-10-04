@@ -37,12 +37,14 @@ export class Store {
       CREATE TABLE IF NOT EXISTS presets (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, name TEXT NOT NULL, is_default INTEGER NOT NULL DEFAULT 0, data TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(user_id, name));
       CREATE TABLE IF NOT EXISTS invites (id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE, note TEXT NOT NULL, max_uses INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0, expires_at INTEGER, created_at INTEGER NOT NULL, created_by TEXT NOT NULL, last_used_at INTEGER);
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_results (task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS billing_cache (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, data TEXT NOT NULL, expires_at INTEGER NOT NULL);
       CREATE INDEX IF NOT EXISTS accounts_owner ON accounts(user_id);
       CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(user_id, created_at);
       CREATE INDEX IF NOT EXISTS audit_owner ON audit(user_id, created_at);
       CREATE INDEX IF NOT EXISTS presets_owner ON presets(user_id, updated_at);
       INSERT OR IGNORE INTO settings(key,value) VALUES('registration_open','0');
-      PRAGMA user_version=4;`);
+      PRAGMA user_version=5;`);
     // Additive migration for databases created before user management existed.
     const userColumns = (
       this.db.prepare("PRAGMA table_info(users)").all() as { name: string }[]
@@ -277,11 +279,17 @@ export class Store {
     }
   }
   tasks(userId: string): Task[] {
-    return this.db
+    const rows = this.db
       .prepare(
-        "SELECT id,account_id AS accountId,kind,target,status,progress,error,created_at AS createdAt,updated_at AS updatedAt FROM tasks WHERE user_id=? ORDER BY created_at DESC LIMIT 100",
+        "SELECT id,account_id AS accountId,kind,target,status,progress,error,created_at AS createdAt,updated_at AS updatedAt,(SELECT data FROM task_results WHERE task_id=tasks.id) AS results FROM tasks WHERE user_id=? ORDER BY created_at DESC LIMIT 100",
       )
-      .all(userId) as unknown as Task[];
+      .all(userId) as unknown as (Omit<Task, "results"> & {
+      results: string | null;
+    })[];
+    return rows.map((row) => ({
+      ...row,
+      results: row.results ? JSON.parse(row.results) : undefined,
+    }));
   }
   audit(userId: string, action: string, target: string) {
     this.db

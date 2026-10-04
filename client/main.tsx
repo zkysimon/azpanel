@@ -12,6 +12,7 @@ import {
   Avatar,
   Button,
   Chip,
+  Checkbox,
   CircularProgress,
   CssBaseline,
   Dialog,
@@ -44,6 +45,7 @@ import {
   ArrowUpRight,
   Bell,
   BookmarkPlus,
+  Bot,
   Check,
   CheckCheck,
   ChevronRight,
@@ -79,6 +81,8 @@ import {
 } from "lucide-react";
 import type {
   Account,
+  BatchDeleteResponse,
+  TaskItemResult,
   Audit,
   Invite,
   Json,
@@ -102,6 +106,8 @@ import {
 import { api, setCsrf } from "./api.js";
 import { makeTheme } from "./theme.js";
 import "./styles.css";
+import BillingCard from "./BillingCard.js";
+import AiPage from "./AiPage.js";
 const MetricsChart = lazy(() => import("./MetricsChart.js"));
 
 type Page =
@@ -109,6 +115,7 @@ type Page =
   | "accounts"
   | "machines"
   | "create"
+  | "ai"
   | "resources"
   | "quota"
   | "tasks"
@@ -756,6 +763,7 @@ function AccountsPage({ notify, revision }: PageProps) {
                 </Tooltip>
               </div>
               <Divider sx={{ my: 2 }} />
+              <BillingCard accountId={account.id} />
               <div className="account-meta">
                 <span>最近同步</span>
                 <span>{date(account.lastSync)}</span>
@@ -1872,10 +1880,17 @@ function ExplorePage({
     [group, setGroup] = useState(""),
     [items, setItems] = useState<Json[] | null>(null),
     [remove, setRemove] = useState(""),
+    [selectedGroups, setSelectedGroups] = useState<string[]>([]),
+    [batchOpen, setBatchOpen] = useState(false),
+    [deleteResults, setDeleteResults] = useState<TaskItemResult[]>([]),
     [confirmation, setConfirmation] = useState("");
   useEffect(() => {
     setData(null);
     setItems(null);
+    setSelectedGroups([]);
+    setDeleteResults([]);
+    setRemove("");
+    setBatchOpen(false);
   }, [account, region, mode]);
   // Region list comes from the selected account.
   useEffect(() => {
@@ -1963,10 +1978,55 @@ function ExplorePage({
         </Button>
       </Paper>
       {busy && <LinearProgress />}
+      {mode === "resources" && data && (
+        <div className="batch-actions">
+          <span>已选择 {selectedGroups.length} 个资源组</span>
+          <Button
+            color="error"
+            startIcon={<Trash2 size={16} />}
+            disabled={!session.writesEnabled || !selectedGroups.length || busy}
+            onClick={() => {
+              setConfirmation("");
+              setBatchOpen(true);
+            }}
+          >
+            删除所选资源组
+          </Button>
+          <span className="muted">仅删除空资源组，非空项会立即显示原因。</span>
+        </div>
+      )}
+      {deleteResults.map((result) => (
+        <Alert
+          key={result.name}
+          severity={result.status === "failed" ? "warning" : "info"}
+          sx={{ mb: 1 }}
+        >
+          {result.name}：{result.message ?? "已加入删除队列"}
+        </Alert>
+      ))}
       <TableContainer component={Paper} className="data-table">
         <Table>
           <TableHead>
             <TableRow>
+              {mode === "resources" && (
+                <TableCell padding="checkbox">
+                  <Checkbox
+                    slotProps={{ input: { "aria-label": "全选资源组" } }}
+                    checked={
+                      !!data?.length && selectedGroups.length === data.length
+                    }
+                    indeterminate={
+                      selectedGroups.length > 0 &&
+                      selectedGroups.length < (data?.length ?? 0)
+                    }
+                    onChange={(_, checked) =>
+                      setSelectedGroups(
+                        checked ? (data?.map((item) => item.name) ?? []) : [],
+                      )
+                    }
+                  />
+                </TableCell>
+              )}
               {(mode === "quota"
                 ? ["配额名称", "已使用", "上限", "使用比例"]
                 : ["资源组", "区域", "状态", "操作"]
@@ -1978,6 +2038,23 @@ function ExplorePage({
           <TableBody>
             {data?.map((item) => (
               <TableRow key={item.id ?? item.name}>
+                {mode === "resources" && (
+                  <TableCell padding="checkbox">
+                    <Checkbox
+                      slotProps={{
+                        input: { "aria-label": `选择资源组 ${item.name}` },
+                      }}
+                      checked={selectedGroups.includes(item.name)}
+                      onChange={(_, checked) =>
+                        setSelectedGroups((current) =>
+                          checked
+                            ? [...current, item.name]
+                            : current.filter((name) => name !== item.name),
+                        )
+                      }
+                    />
+                  </TableCell>
+                )}
                 <TableCell>
                   <b>{item.label ?? item.name}</b>
                   {item.label && (
@@ -2085,8 +2162,8 @@ function ExplorePage({
       </Dialog>
       <ConfirmDialog
         open={!!remove}
-        title="删除资源组及其全部资源"
-        description="此操作将永久删除该资源组及其中的虚拟机、磁盘、IP 等资源，无法撤销。"
+        title="删除空资源组"
+        description="删除前会检查组内资源。存在虚拟机、磁盘、网络或其他资源时将立即拒绝，并说明原因。"
         target={remove}
         value={confirmation}
         onChange={setConfirmation}
@@ -2101,6 +2178,34 @@ function ExplorePage({
             notify("资源组删除任务已提交");
           } catch (e) {
             notify((e as Error).message);
+          }
+        }}
+      />
+      <ConfirmDialog
+        open={batchOpen}
+        title="批量删除空资源组"
+        description={`将逐项检查所选 ${selectedGroups.length} 个资源组。非空组跳过并报告原因，空组加入后台删除任务。输入 DELETE 确认。`}
+        target="DELETE"
+        value={confirmation}
+        onChange={setConfirmation}
+        onClose={() => setBatchOpen(false)}
+        onConfirm={async () => {
+          try {
+            const result = await api<BatchDeleteResponse>(
+              `/accounts/${account}/groups/delete-batch`,
+              "POST",
+              { groups: selectedGroups, confirmation },
+            );
+            setDeleteResults(result.results);
+            setBatchOpen(false);
+            setSelectedGroups([]);
+            notify(
+              result.taskId
+                ? "空资源组已加入删除任务，详细结果见任务中心"
+                : "未执行删除，请查看逐项原因",
+            );
+          } catch (error) {
+            notify((error as Error).message);
           }
         }}
       />
@@ -2155,6 +2260,14 @@ function TasksPage({ revision }: PageProps) {
                     {task.error}
                   </Alert>
                 )}
+                {task.results?.map((result) => (
+                  <div className="task-result" key={result.name}>
+                    <b>{result.name}</b> ·{" "}
+                    {result.status === "succeeded"
+                      ? "删除成功"
+                      : (result.message ?? result.status)}
+                  </div>
+                ))}
                 <small>{date(task.createdAt)}</small>
               </div>
               <Status
@@ -2315,7 +2428,7 @@ function SettingsPage({ session, notify }: PageProps) {
           {users.map((member) => {
             const self = member.id === session.user?.id;
             return (
-              <div className="resource-line" key={member.id}>
+              <div className="resource-line member-row" key={member.id}>
                 <Avatar
                   sx={{ width: 34, height: 34 }}
                   src={member.avatarUrl ?? undefined}
@@ -2323,97 +2436,105 @@ function SettingsPage({ session, notify }: PageProps) {
                   {member.email[0].toUpperCase()}
                 </Avatar>
                 <div className="resource-line-main">
-                  <b>{member.email}</b>
+                  <b className="member-email" title={member.email}>
+                    {member.email}
+                  </b>
                   <span>
                     {member.accounts} 个账户 · {member.machines} 台虚拟机 ·{" "}
                     {member.createdAt ? date(member.createdAt) : ""}
                   </span>
                 </div>
-                <Chip
-                  size="small"
-                  color={member.role === "admin" ? "primary" : "default"}
-                  label={member.role === "admin" ? "管理员" : "成员"}
-                />
-                <Chip
-                  size="small"
-                  color={member.disabled ? "error" : "success"}
-                  label={member.disabled ? "已停用" : "正常"}
-                />
-                <Tooltip title="编辑邮箱与角色">
-                  <span>
+                <div className="member-badges">
+                  <Chip
+                    size="small"
+                    color={member.role === "admin" ? "primary" : "default"}
+                    label={member.role === "admin" ? "管理员" : "成员"}
+                  />
+                  <Chip
+                    size="small"
+                    color={member.disabled ? "error" : "success"}
+                    label={member.disabled ? "已停用" : "正常"}
+                  />
+                </div>
+                <div className="member-actions">
+                  <Tooltip title="编辑邮箱与角色">
+                    <span>
+                      <IconButton
+                        aria-label="编辑用户"
+                        onClick={() => {
+                          setEditing(member);
+                          setEditEmail(member.email);
+                          setEditRole(member.role);
+                          setManageError("");
+                        }}
+                      >
+                        <Pencil size={16} />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                  <Tooltip title="重置密码">
                     <IconButton
-                      aria-label="编辑用户"
+                      aria-label="重置密码"
                       onClick={() => {
-                        setEditing(member);
-                        setEditEmail(member.email);
-                        setEditRole(member.role);
+                        setResetTarget(member);
+                        setResetValue("");
                         setManageError("");
                       }}
                     >
-                      <Pencil size={16} />
+                      <KeyRound size={16} />
                     </IconButton>
-                  </span>
-                </Tooltip>
-                <Tooltip title="重置密码">
-                  <IconButton
-                    aria-label="重置密码"
-                    onClick={() => {
-                      setResetTarget(member);
-                      setResetValue("");
-                      setManageError("");
-                    }}
+                  </Tooltip>
+                  <Tooltip
+                    title={
+                      self
+                        ? "不能停用自己"
+                        : member.disabled
+                          ? "启用账户"
+                          : "停用账户"
+                    }
                   >
-                    <KeyRound size={16} />
-                  </IconButton>
-                </Tooltip>
-                <Tooltip
-                  title={
-                    self
-                      ? "不能停用自己"
-                      : member.disabled
-                        ? "启用账户"
-                        : "停用账户"
-                  }
-                >
-                  <span>
-                    <IconButton
-                      aria-label={member.disabled ? "启用用户" : "停用用户"}
-                      disabled={self}
-                      onClick={async () => {
-                        try {
-                          await api(`/users/${member.id}`, "PATCH", {
-                            disabled: !member.disabled,
-                          });
-                          await loadUsers();
-                          notify(member.disabled ? "账户已启用" : "账户已停用");
-                        } catch (e) {
-                          notify((e as Error).message);
-                        }
-                      }}
-                    >
-                      {member.disabled ? (
-                        <UserCheck size={16} />
-                      ) : (
-                        <UserX size={16} />
-                      )}
-                    </IconButton>
-                  </span>
-                </Tooltip>
-                <Tooltip title={self ? "不能删除自己" : "删除用户"}>
-                  <span>
-                    <IconButton
-                      aria-label="删除用户"
-                      disabled={self}
-                      onClick={() => {
-                        setDeleteTarget(member);
-                        setDeleteConfirm("");
-                        setManageError("");
-                      }}
-                    >
-                      <Trash2 size={16} />
-                    </IconButton>
-                  </span>
-                </Tooltip>
+                    <span>
+                      <IconButton
+                        aria-label={member.disabled ? "启用用户" : "停用用户"}
+                        disabled={self}
+                        onClick={async () => {
+                          try {
+                            await api(`/users/${member.id}`, "PATCH", {
+                              disabled: !member.disabled,
+                            });
+                            await loadUsers();
+                            notify(
+                              member.disabled ? "账户已启用" : "账户已停用",
+                            );
+                          } catch (e) {
+                            notify((e as Error).message);
+                          }
+                        }}
+                      >
+                        {member.disabled ? (
+                          <UserCheck size={16} />
+                        ) : (
+                          <UserX size={16} />
+                        )}
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                  <Tooltip title={self ? "不能删除自己" : "删除用户"}>
+                    <span>
+                      <IconButton
+                        aria-label="删除用户"
+                        disabled={self}
+                        onClick={() => {
+                          setDeleteTarget(member);
+                          setDeleteConfirm("");
+                          setManageError("");
+                        }}
+                      >
+                        <Trash2 size={16} />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                </div>
               </div>
             );
           })}
@@ -2783,6 +2904,7 @@ const nav = [
   { page: "overview", label: "概览", icon: LayoutDashboard },
   { page: "accounts", label: "云账户", icon: Cloud },
   { page: "machines", label: "虚拟机", icon: Server },
+  { page: "ai", label: "AI 模型", icon: Bot },
   { page: "resources", label: "资源浏览器", icon: Folder },
   { page: "quota", label: "订阅配额", icon: Gauge },
   { page: "tasks", label: "任务中心", icon: ListChecks },
@@ -2985,7 +3107,9 @@ function App() {
                 </div>
               </header>
               <main className="main-content" key={page}>
-                {page === "accounts" ? (
+                {page === "ai" ? (
+                  <AiPage {...props} />
+                ) : page === "accounts" ? (
                   <AccountsPage {...props} />
                 ) : page === "machines" ? (
                   <MachinesPage {...props} />

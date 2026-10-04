@@ -292,7 +292,12 @@ try {
       confirmation: name,
       location: region,
       size: chosen.name,
-      image: "ubuntu-24",
+      image: {
+        publisher: "Canonical",
+        offer: "ubuntu-24_04-lts",
+        sku: "server",
+        version: "latest",
+      },
       diskSize: 30,
       username: "azuretest",
       authentication: "password",
@@ -345,10 +350,14 @@ try {
       ) {
         log("CLEANUP_START", group);
         try {
-          await task(
-            `/accounts/${account.id}/groups`,
-            { group, confirmation: group },
+          // This opt-in test owns the entire random test group. The panel's
+          // normal delete endpoint now deliberately refuses non-empty groups.
+          await azure.operation(
+            credentials,
             "DELETE",
+            `${root}?api-version=2021-04-01`,
+            undefined,
+            (message) => log("CLEANUP", message),
           );
         } catch (error) {
           log("CLEANUP_API_ERROR", (error as Error).message);
