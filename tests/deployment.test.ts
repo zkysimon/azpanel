@@ -15,6 +15,31 @@ test("creation checks availability and group collision before submitting depende
         url: path,
         body: options!.body ? JSON.parse(String(options!.body)) : null,
       });
+      if (path.includes("/locations?"))
+        return Response.json({
+          value: [
+            {
+              name: "eastus",
+              displayName: "East US",
+              metadata: {
+                regionType: "Physical",
+                geographyGroup: "North America",
+              },
+            },
+          ],
+        });
+      if (path.includes("/versions?"))
+        return Response.json([{ name: "24.04.202609040" }]);
+      if (path.includes("/versions/24.04.202609040?"))
+        return Response.json({
+          properties: {
+            hyperVGeneration: "V2",
+            architecture: "x64",
+            osDiskImage: { sizeInGb: 30 },
+          },
+        });
+      if (path.includes("/artifacttypes/"))
+        throw new Error(`Unexpected image API: ${path}`);
       if (path.includes("/skus?"))
         return Response.json({
           value: [
@@ -67,6 +92,12 @@ test("creation checks availability and group collision before submitting depende
     writes[2].body.properties.template.resources.some(
       (resource: any) => resource.type === "Microsoft.Compute/virtualMachines",
     ),
+  );
+  assert.equal(
+    writes[2].body.properties.template.resources.find(
+      (resource: any) => resource.type === "Microsoft.Compute/virtualMachines",
+    ).properties.storageProfile.imageReference.version,
+    "24.04.202609040",
   );
   assert.ok(
     !JSON.stringify(writes[2].body.properties.template).includes(

@@ -54,6 +54,8 @@ export interface AiModelSku {
   maximum: number | null;
   step: number;
   default: number;
+  defaultSource: "azure" | "minimum" | "fallback";
+  azureDefault: number | null;
   allowedValues: number[];
 }
 export interface AiModel {

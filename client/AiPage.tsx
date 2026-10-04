@@ -23,6 +23,9 @@ import {
 import { Bot, ExternalLink, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "./api.js";
 import type { Account, Json, Location, Session } from "../shared/types.js";
+import InlineTask from "./InlineTask.js";
+import { useInlineTask } from "./useInlineTask.js";
+import RegionSelect from "./RegionSelect.js";
 import type {
   AiDeployment,
   AiModel,
@@ -33,11 +36,10 @@ import type {
 interface Props {
   session: Session;
   notify: (message: string) => void;
-  navigate: (page: "tasks") => void;
 }
 const modelKey = (model: AiModel) =>
   `${model.format}:${model.name}:${model.version}`;
-export default function AiPage({ session, notify, navigate }: Props) {
+export default function AiPage({ session, notify }: Props) {
   const [accounts, setAccounts] = useState<Account[]>([]),
     [accountId, setAccountId] = useState("");
   const [services, setServices] = useState<AiService[]>([]),
@@ -46,7 +48,13 @@ export default function AiPage({ session, notify, navigate }: Props) {
     [deployments, setDeployments] = useState<AiDeployment[]>([]);
   const [usage, setUsage] = useState<AiUsage[]>([]),
     [usageError, setUsageError] = useState("");
-  const [busy, setBusy] = useState(false),
+  const [loadingServices, setLoadingServices] = useState(false),
+    [loadingDeployments, setLoadingDeployments] = useState(false),
+    [loadingModels, setLoadingModels] = useState(false),
+    [loadingUsage, setLoadingUsage] = useState(false),
+    [modelError, setModelError] = useState(""),
+    [modelReload, setModelReload] = useState(0),
+    [deploymentRefresh, setDeploymentRefresh] = useState(0),
     [error, setError] = useState(""),
     [refresh, setRefresh] = useState(0);
   const [deployOpen, setDeployOpen] = useState(false),
@@ -78,6 +86,12 @@ export default function AiPage({ session, notify, navigate }: Props) {
         name: service.name,
       }).toString()
     : "";
+  const operation = useInlineTask((task, job) => {
+    if (job.accountId !== accountId) return;
+    if (job.context === "service") setRefresh((value) => value + 1);
+    else if (job.context === query) setDeploymentRefresh((value) => value + 1);
+    if (task.status === "succeeded") notify(`${job.kind}已完成`);
+  });
   useEffect(() => {
     let active = true;
     api<Account[]>("/accounts")
@@ -93,26 +107,30 @@ export default function AiPage({ session, notify, navigate }: Props) {
   }, []);
   useEffect(() => {
     let active = true;
-    setServices([]);
-    setServiceId("");
-    setModels([]);
-    setDeployments([]);
-    setUsage([]);
     setError("");
-    if (!accountId) return;
-    setBusy(true);
-    api<AiService[]>(`/accounts/${accountId}/ai/services`)
+    if (!accountId) {
+      setLoadingServices(false);
+      return;
+    }
+    setLoadingServices(true);
+    api<AiService[]>(
+      `/accounts/${accountId}/ai/services${refresh ? "?refresh=true" : ""}`,
+    )
       .then((items) => {
         if (active) {
           setServices(items);
-          setServiceId(items[0]?.id ?? "");
+          setServiceId((previous) =>
+            items.some((item) => item.id === previous)
+              ? previous
+              : (items[0]?.id ?? ""),
+          );
         }
       })
       .catch((error) => {
         if (active) setError(error.message);
       })
       .finally(() => {
-        if (active) setBusy(false);
+        if (active) setLoadingServices(false);
       });
     return () => {
       active = false;
@@ -120,41 +138,77 @@ export default function AiPage({ session, notify, navigate }: Props) {
   }, [accountId, refresh]);
   useEffect(() => {
     let active = true;
-    setModels([]);
-    setDeployments([]);
-    setUsage([]);
-    setUsageError("");
-    setModel(null);
     setError("");
-    if (!query) return;
-    setBusy(true);
-    Promise.all([
-      api<AiModel[]>(`/accounts/${accountId}/ai/models?${query}`),
-      api<AiDeployment[]>(`/accounts/${accountId}/ai/deployments?${query}`),
-      api<AiUsage[]>(`/accounts/${accountId}/ai/usages?${query}`).catch(
-        (error) => {
-          if (active) setUsageError(error.message);
-          return [];
-        },
-      ),
-    ])
-      .then(([models, deployments, usages]) => {
-        if (active) {
-          setModels(models);
-          setDeployments(deployments);
-          setUsage(usages);
-        }
+    if (!query) {
+      setLoadingDeployments(false);
+      return;
+    }
+    setLoadingDeployments(true);
+    api<AiDeployment[]>(
+      `/accounts/${accountId}/ai/deployments?${query}${deploymentRefresh ? "&refresh=true" : ""}`,
+    )
+      .then((items) => {
+        if (active) setDeployments(items);
       })
       .catch((error) => {
         if (active) setError(error.message);
       })
       .finally(() => {
-        if (active) setBusy(false);
+        if (active) setLoadingDeployments(false);
       });
     return () => {
       active = false;
     };
-  }, [accountId, query]);
+  }, [accountId, query, deploymentRefresh]);
+  // Catalogs and quota are independent of the deployment list, and load only
+  // when the user opens the deployment form. A slow quota request cannot block it.
+  useEffect(() => {
+    let active = true;
+    setModels([]);
+    setModel(null);
+    setModelError("");
+    if (!query || !deployOpen) {
+      setLoadingModels(false);
+      return;
+    }
+    setLoadingModels(true);
+    api<AiModel[]>(`/accounts/${accountId}/ai/models?${query}`)
+      .then((items) => {
+        if (active) setModels(items);
+      })
+      .catch((error) => {
+        if (active) setModelError(error.message);
+      })
+      .finally(() => {
+        if (active) setLoadingModels(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [accountId, query, deployOpen, modelReload]);
+  useEffect(() => {
+    let active = true;
+    setUsage([]);
+    setUsageError("");
+    if (!query || !deployOpen) {
+      setLoadingUsage(false);
+      return;
+    }
+    setLoadingUsage(true);
+    api<AiUsage[]>(`/accounts/${accountId}/ai/usages?${query}`)
+      .then((items) => {
+        if (active) setUsage(items);
+      })
+      .catch((error) => {
+        if (active) setUsageError(error.message);
+      })
+      .finally(() => {
+        if (active) setLoadingUsage(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [accountId, query, deployOpen]);
   const resetDialog = () => {
     setName("");
     setConfirmation("");
@@ -187,8 +241,9 @@ export default function AiPage({ session, notify, navigate }: Props) {
     setSaving(true);
     setDialogError("");
     try {
+      let result: { taskId: string };
       if (kind === "service")
-        await api(`/accounts/${accountId}/ai/services`, "POST", {
+        result = await api(`/accounts/${accountId}/ai/services`, "POST", {
           group: newGroup,
           location: newLocation,
           name,
@@ -196,7 +251,7 @@ export default function AiPage({ session, notify, navigate }: Props) {
           confirmation,
         });
       else if (kind === "deploy" && service && model)
-        await api(`/accounts/${accountId}/ai/deployments`, "POST", {
+        result = await api(`/accounts/${accountId}/ai/deployments`, "POST", {
           group: service.group,
           name: service.name,
           deployment: name,
@@ -210,18 +265,29 @@ export default function AiPage({ session, notify, navigate }: Props) {
           confirmation,
         });
       else if (kind === "delete" && service && remove)
-        await api(`/accounts/${accountId}/ai/deployments`, "DELETE", {
+        result = await api(`/accounts/${accountId}/ai/deployments`, "DELETE", {
           group: service.group,
           name: service.name,
           deployment: remove.name,
           confirmation,
         });
       else return;
+      operation.start({
+        id: result.taskId,
+        accountId,
+        target: kind === "delete" ? remove!.name : name,
+        kind:
+          kind === "service"
+            ? "创建 AI 服务"
+            : kind === "deploy"
+              ? "部署 AI 模型"
+              : "删除 AI 部署",
+        context: kind === "service" ? "service" : query,
+      });
       setServiceOpen(false);
       setDeployOpen(false);
       setRemove(null);
-      notify("AI 操作已加入后台任务队列");
-      navigate("tasks");
+      notify("操作已提交，进度将在当前页更新");
     } catch (error) {
       setDialogError((error as Error).message);
     } finally {
@@ -242,7 +308,7 @@ export default function AiPage({ session, notify, navigate }: Props) {
           variant="contained"
           startIcon={<Plus size={17} />}
           disabled={
-            !service || busy || !session.writesEnabled || !models.length
+            !service || saving || operation.running || !session.writesEnabled
           }
           onClick={() => {
             resetDialog();
@@ -254,6 +320,11 @@ export default function AiPage({ session, notify, navigate }: Props) {
           部署模型
         </Button>
       </div>
+      <InlineTask
+        job={operation.job}
+        task={operation.task}
+        error={operation.error}
+      />
       {!session.writesEnabled && (
         <Alert severity="info" sx={{ mb: 2 }}>
           当前为只读模式，可查看模型及部署；创建或删除需启用云端写操作。
@@ -269,8 +340,15 @@ export default function AiPage({ session, notify, navigate }: Props) {
           label="Azure 账户"
           select
           value={accountId}
-          disabled={busy}
-          onChange={(event) => setAccountId(event.target.value)}
+          disabled={saving}
+          onChange={(event) => {
+            setAccountId(event.target.value);
+            setServices([]);
+            setServiceId("");
+            setDeployments([]);
+            setRefresh(0);
+            setDeploymentRefresh(0);
+          }}
         >
           <MenuItem value="">请选择账户</MenuItem>
           {accounts.map((item) => (
@@ -283,8 +361,11 @@ export default function AiPage({ session, notify, navigate }: Props) {
           label="AI 服务资源"
           select
           value={serviceId}
-          disabled={busy || !services.length}
-          onChange={(event) => setServiceId(event.target.value)}
+          disabled={loadingServices || saving || !services.length}
+          onChange={(event) => {
+            setServiceId(event.target.value);
+            setDeployments([]);
+          }}
         >
           <MenuItem value="">请选择 AI 服务</MenuItem>
           {services.map((item) => (
@@ -295,19 +376,32 @@ export default function AiPage({ session, notify, navigate }: Props) {
         </TextField>
         <Button
           aria-label="刷新 AI 服务"
-          disabled={!accountId || busy}
-          onClick={() => setRefresh((value) => value + 1)}
+          disabled={!accountId || loadingServices || loadingDeployments}
+          onClick={() => {
+            setRefresh((value) => value + 1);
+            setDeploymentRefresh((value) => value + 1);
+          }}
         >
           <RefreshCw size={17} />
         </Button>
         <Button
-          disabled={!accountId || busy || !session.writesEnabled}
+          disabled={
+            !accountId ||
+            loadingServices ||
+            operation.running ||
+            !session.writesEnabled
+          }
           onClick={prepareService}
         >
           创建 AI 服务
         </Button>
       </Paper>
-      {busy && <LinearProgress />}
+      {loadingServices && (
+        <>
+          <p className="muted">正在读取 AI 服务列表…</p>
+          <LinearProgress />
+        </>
+      )}
       {service && (
         <Paper className="ai-service-summary">
           <Bot size={26} />
@@ -334,9 +428,14 @@ export default function AiPage({ session, notify, navigate }: Props) {
           <h2>模型部署</h2>
           <Chip
             size="small"
-            label={`${deployments.length} 个部署 · ${models.length} 个模型版本`}
+            label={
+              loadingDeployments
+                ? "正在读取部署…"
+                : `${deployments.length} 个部署`
+            }
           />
         </div>
+        {loadingDeployments && <LinearProgress />}
         <TableContainer>
           <Table>
             <TableHead>
@@ -370,7 +469,9 @@ export default function AiPage({ session, notify, navigate }: Props) {
                     <Button
                       color="error"
                       startIcon={<Trash2 size={15} />}
-                      disabled={!session.writesEnabled}
+                      disabled={
+                        !session.writesEnabled || operation.running || saving
+                      }
                       onClick={() => {
                         resetDialog();
                         setRemove(item);
@@ -384,21 +485,21 @@ export default function AiPage({ session, notify, navigate }: Props) {
             </TableBody>
           </Table>
         </TableContainer>
-        {!deployments.length && !busy && (
-          <div className="empty">
-            <Bot size={28} />
-            <h3>{service ? "还没有部署模型" : "选择或创建 AI 服务资源"}</h3>
-            <p>
-              {service
-                ? "点击部署模型选择当前服务可用的模型版本。"
-                : "服务列表来自当前订阅；没有资源时可以在已有资源组中创建。"}
-            </p>
-          </div>
-        )}
+        {!deployments.length &&
+          !loadingServices &&
+          !loadingDeployments &&
+          !error && (
+            <div className="empty">
+              <Bot size={28} />
+              <h3>{service ? "还没有部署模型" : "选择或创建 AI 服务资源"}</h3>
+              <p>
+                {service
+                  ? "点击部署模型选择当前服务可用的模型版本。"
+                  : "服务列表来自当前订阅；没有资源时可以在已有资源组中创建。"}
+              </p>
+            </div>
+          )}
       </Paper>
-      {usageError && (
-        <Alert severity="warning">配额暂不可读：{usageError}</Alert>
-      )}
       <Dialog
         open={deployOpen}
         onClose={() => !saving && setDeployOpen(false)}
@@ -409,11 +510,34 @@ export default function AiPage({ session, notify, navigate }: Props) {
         <DialogContent>
           <Stack spacing={3} sx={{ pt: 1 }}>
             {dialogError && <Alert severity="error">{dialogError}</Alert>}
+            {loadingModels && (
+              <>
+                <span>正在读取模型目录…</span>
+                <LinearProgress />
+              </>
+            )}
+            {modelError && (
+              <Alert
+                severity="error"
+                action={
+                  <Button onClick={() => setModelReload((value) => value + 1)}>
+                    重试
+                  </Button>
+                }
+              >
+                {modelError}
+              </Alert>
+            )}
+            {!loadingModels && !modelError && !models.length && (
+              <Alert severity="info">当前 AI 服务没有返回可用模型。</Alert>
+            )}
             <Autocomplete
               options={models.filter(
                 (model) => model.lifecycle !== "Deprecated",
               )}
               value={model}
+              loading={loadingModels}
+              disabled={loadingModels}
               isOptionEqualToValue={(a, b) => modelKey(a) === modelKey(b)}
               getOptionLabel={(model) =>
                 `${model.name} · ${model.version} · ${model.format}`
@@ -460,10 +584,16 @@ export default function AiPage({ session, notify, navigate }: Props) {
               onChange={(event) => setCapacity(Number(event.target.value))}
               helperText={
                 selectedSku
-                  ? `允许 ${selectedSku.minimum}–${selectedSku.maximum ?? "未提供上限"}，步长 ${selectedSku.step}。不同模型的容量与 TPM 换算不同。`
+                  ? `${selectedSku.defaultSource === "azure" ? `Azure 默认值：${selectedSku.azureDefault}` : selectedSku.defaultSource === "minimum" ? `Azure 未提供默认值，使用最小值：${selectedSku.default}` : "Azure 未提供默认值和最小值，暂填 1"}。允许 ${selectedSku.minimum}–${selectedSku.maximum ?? "未提供上限"}，步长 ${selectedSku.step}。不是剩余配额或模型份数。`
                   : "请先选择模型和部署类型"
               }
             />
+            {loadingUsage && (
+              <span className="muted">正在后台读取配额，不影响模型选择…</span>
+            )}
+            {usageError && (
+              <Alert severity="warning">配额暂不可读：{usageError}</Alert>
+            )}
             {usedQuota && (
               <Alert severity="info">
                 {usedQuota.label}：已用 {usedQuota.current} / 上限{" "}
@@ -493,6 +623,8 @@ export default function AiPage({ session, notify, navigate }: Props) {
             variant="contained"
             disabled={
               saving ||
+              loadingModels ||
+              operation.running ||
               !model ||
               !sku ||
               !name ||
@@ -528,19 +660,12 @@ export default function AiPage({ session, notify, navigate }: Props) {
                 </MenuItem>
               ))}
             </TextField>
-            <TextField
-              label="区域"
-              select
+            <RegionSelect
+              regions={locations}
               value={newLocation}
-              onChange={(event) => setNewLocation(event.target.value)}
-            >
-              <MenuItem value="">请选择区域</MenuItem>
-              {locations.map((item) => (
-                <MenuItem key={item.name} value={item.name}>
-                  {item.displayName} · {item.name}
-                </MenuItem>
-              ))}
-            </TextField>
+              onChange={setNewLocation}
+              loading={saving && !locations.length}
+            />
             <TextField
               label="服务类型"
               select

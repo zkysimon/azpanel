@@ -45,6 +45,27 @@ const azure = new Azure(
   new RequestGate(0),
   async (url, options) => {
     const path = new URL(String(url)).pathname;
+    if (path.endsWith("/versions"))
+      return Response.json([{ name: "24.04.202609040" }]);
+    if (path.endsWith("/versions/24.04.202609040"))
+      return Response.json({
+        properties: {
+          hyperVGeneration: "V2",
+          architecture: "x64",
+          osDiskImage: { sizeInGb: 30 },
+        },
+      });
+    if (
+      path.endsWith("/providers/Microsoft.Compute") ||
+      path.endsWith("/providers/Microsoft.Network")
+    )
+      return Response.json({ registrationState: "Registered" });
+    if (
+      !path.includes("/Microsoft.CognitiveServices/") &&
+      (options?.method === "PUT" ||
+        (options?.method === "POST" && path.endsWith("/validate")))
+    )
+      return Response.json({ properties: { provisioningState: "Succeeded" } });
     if (path.includes("/Microsoft.CognitiveServices/")) {
       if (path.endsWith("/models"))
         return Response.json({
@@ -143,14 +164,45 @@ const azure = new Azure(
     if (String(url).includes("/locations?"))
       return Response.json({
         value: [
-          { name: "eastasia", displayName: "East Asia", metadata: {} },
-          { name: "japaneast", displayName: "Japan East", metadata: {} },
+          {
+            name: "asia",
+            displayName: "Asia",
+            metadata: { regionType: "Logical", geographyGroup: "Asia Pacific" },
+          },
+          {
+            name: "australiaeast",
+            displayName: "Australia East",
+            metadata: {
+              regionType: "Physical",
+              geography: "Australia",
+              geographyGroup: "Asia Pacific",
+            },
+          },
+          {
+            name: "francecentral",
+            displayName: "France Central",
+            metadata: { regionType: "Physical", geographyGroup: "Europe" },
+          },
+          {
+            name: "eastasia",
+            displayName: "East Asia",
+            metadata: {
+              regionType: "Physical",
+              geographyGroup: "Asia Pacific",
+            },
+          },
+          {
+            name: "japaneast",
+            displayName: "Japan East",
+            metadata: {
+              regionType: "Physical",
+              geographyGroup: "Asia Pacific",
+            },
+          },
         ],
       });
     if (String(url).includes("/artifacttypes/vmimage/offers/"))
-      return Response.json({
-        value: [{ name: "server" }, { name: "gen1" }],
-      });
+      return Response.json([{ name: "server" }, { name: "gen1" }]);
     if (String(url).includes("/skus?"))
       return Response.json({
         value: [

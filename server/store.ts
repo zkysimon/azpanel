@@ -291,6 +291,14 @@ export class Store {
       results: row.results ? JSON.parse(row.results) : undefined,
     }));
   }
+  task(userId: string, id: string): Task | null {
+    const row = this.db
+      .prepare(
+        "SELECT id,account_id AS accountId,kind,target,status,progress,error,created_at AS createdAt,updated_at AS updatedAt FROM tasks WHERE id=? AND user_id=?",
+      )
+      .get(id, userId);
+    return (row as unknown as Task) ?? null;
+  }
   audit(userId: string, action: string, target: string) {
     this.db
       .prepare(

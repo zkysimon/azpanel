@@ -101,6 +101,8 @@ export interface Location {
   displayName: string;
   regionalDisplayName: string;
   geography: string;
+  geographyGroup?: string;
+  continent?: string;
 }
 import type { VmSettings } from "./validation.js";
 export interface VmPreset {

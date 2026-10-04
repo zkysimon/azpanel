@@ -108,6 +108,9 @@ import { makeTheme } from "./theme.js";
 import "./styles.css";
 import BillingCard from "./BillingCard.js";
 import AiPage from "./AiPage.js";
+import RegionSelect from "./RegionSelect.js";
+import InlineTask from "./InlineTask.js";
+import { useInlineTask } from "./useInlineTask.js";
 const MetricsChart = lazy(() => import("./MetricsChart.js"));
 
 type Page =
@@ -1279,7 +1282,7 @@ function MachineDetails({
   );
 }
 
-function CreatePage({ session, notify, navigate }: PageProps) {
+function CreatePage({ session, notify }: PageProps) {
   const { data: accounts } = useLoad(() => api<Account[]>("/accounts"), []);
   const [accountId, setAccountId] = useState(""),
     [skus, setSkus] = useState<Sku[]>([]),
@@ -1290,6 +1293,8 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     [loadingLocations, setLoadingLocations] = useState(false),
     [loadingImages, setLoadingImages] = useState(false),
     [loadingSkus, setLoadingSkus] = useState(false),
+    [regionReload, setRegionReload] = useState(0),
+    [imageReload, setImageReload] = useState(0),
     [presets, setPresets] = useState<VmPreset[]>([]),
     [presetId, setPresetId] = useState(""),
     [saveOpen, setSaveOpen] = useState(false),
@@ -1314,6 +1319,10 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     confirmation: "",
   });
   const busy = loadingLocations || loadingImages || loadingSkus;
+  const operation = useInlineTask((task) => {
+    if (task.status === "succeeded")
+      notify("虚拟机创建完成，资源已同步；当前配置已保留");
+  });
   const field = <K extends keyof CreateVm>(key: K, value: CreateVm[K]) =>
     setForm((old) => ({ ...old, [key]: value }));
   const imageValue = (option: {
@@ -1405,40 +1414,62 @@ function CreatePage({ session, notify, navigate }: PageProps) {
       .then((list) => {
         if (!current) return;
         setLocations(list);
-        if (!list.some((location) => location.name === form.location))
-          field("location", list[0]?.name ?? "");
+        setForm((current) => ({
+          ...current,
+          location: list.some((region) => region.name === current.location)
+            ? current.location
+            : (list[0]?.name ?? ""),
+        }));
       })
       .catch((e) => current && setLocationsError((e as Error).message))
       .finally(() => current && setLoadingLocations(false));
     return () => {
       current = false;
     };
-  }, [accountId]);
+  }, [accountId, regionReload]);
   // Images are discovered live per region (server caches them 24h).
   useEffect(() => {
-    if (!accountId || !form.location) return;
+    if (
+      !accountId ||
+      !locations.some((region) => region.name === form.location)
+    ) {
+      setLoadingImages(false);
+      return;
+    }
     let current = true;
     setLoadingImages(true);
     setImagesError("");
+    setImages([]);
     api<ImageOption[]>(
       `/accounts/${accountId}/images?region=${encodeURIComponent(form.location)}`,
     )
       .then((list) => {
-        if (!current || !list.length) return;
+        if (!current) return;
         setImages(list);
-        const keep = list.find(
-          (option) => imageValue(option) === imageValue(form.image),
-        );
-        const chosen = keep ?? list[0];
-        field("image", chosen);
-        if (looksLikeWindows(chosen)) field("authentication", "password");
+        if (!list.length) {
+          setImagesError("此区域未返回可用镜像，请选择其他实体区域或重试");
+          return;
+        }
+        setForm((current) => {
+          const chosen =
+            list.find(
+              (option) => imageValue(option) === imageValue(current.image),
+            ) ?? list[0];
+          return {
+            ...current,
+            image: chosen,
+            authentication: looksLikeWindows(chosen)
+              ? "password"
+              : current.authentication,
+          };
+        });
       })
       .catch((e) => current && setImagesError((e as Error).message))
       .finally(() => current && setLoadingImages(false));
     return () => {
       current = false;
     };
-  }, [accountId, form.location]);
+  }, [accountId, form.location, locations, imageReload]);
   // Switching region or account invalidates previously loaded sizes.
   useEffect(() => {
     setSkus([]);
@@ -1460,12 +1491,22 @@ function CreatePage({ session, notify, navigate }: PageProps) {
   }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
+    if (operation.running || busy) return;
     setError("");
     setLoadingSkus(true);
     try {
-      await api(`/accounts/${accountId}/machines`, "POST", form);
-      notify("创建任务已提交。请到任务中心查看进度。");
-      navigate("tasks");
+      const result = await api<{ taskId: string }>(
+        `/accounts/${accountId}/machines`,
+        "POST",
+        form,
+      );
+      operation.start({
+        id: result.taskId,
+        accountId,
+        kind: "创建虚拟机",
+        target: form.name,
+      });
+      notify("创建已提交，进度将在当前页面更新");
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -1478,6 +1519,11 @@ function CreatePage({ session, notify, navigate }: PageProps) {
         eyebrow="NEW COMPUTE RESOURCE"
         title="创建虚拟机"
         description="选择配置，连接你的下一台云服务器。"
+      />
+      <InlineTask
+        job={operation.job}
+        task={operation.task}
+        error={operation.error}
       />
       <form onSubmit={submit}>
         <LoadError error={error} />
@@ -1565,33 +1611,34 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                   onChange={(e) => field("name", e.target.value)}
                   helperText="以字母开头，可使用字母、数字和连字符"
                 />
-                <TextField
-                  select
-                  label="区域"
-                  required
-                  value={form.location}
-                  onChange={(e) => field("location", e.target.value)}
-                  disabled={loadingLocations || !locations.length}
-                  helperText={
-                    locationsError ||
-                    (loadingLocations
-                      ? "正在从 Azure 读取可用区域…"
-                      : "来自当前订阅的可用区域")
-                  }
-                >
-                  <MenuItem value="" disabled>
-                    {loadingLocations ? "读取中…" : "请选择区域"}
-                  </MenuItem>
-                  {locations.map((location) => (
-                    <MenuItem key={location.name} value={location.name}>
-                      {location.displayName} · {location.name}
-                    </MenuItem>
-                  ))}
-                </TextField>
+                <div>
+                  <RegionSelect
+                    regions={locations}
+                    value={form.location}
+                    onChange={(value) => field("location", value)}
+                    loading={loadingLocations}
+                    error={locationsError}
+                  />
+                  {!loadingLocations &&
+                    (locationsError || !locations.length) && (
+                      <Button
+                        disabled={!accountId}
+                        onClick={() => setRegionReload((value) => value + 1)}
+                      >
+                        重新加载区域
+                      </Button>
+                    )}
+                </div>
                 <TextField
                   select
                   label="系统镜像"
-                  value={imageValue(form.image)}
+                  value={
+                    images.some(
+                      (item) => imageValue(item) === imageValue(form.image),
+                    )
+                      ? imageValue(form.image)
+                      : ""
+                  }
                   disabled={loadingImages || !images.length}
                   onChange={(e) => {
                     const option = images.find(
@@ -1609,6 +1656,9 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                       : "来自 Azure 的镜像目录，结果缓存 24 小时")
                   }
                 >
+                  <MenuItem value="" disabled>
+                    请选择镜像
+                  </MenuItem>
                   {images.map((option) => (
                     <MenuItem
                       key={imageValue(option)}
@@ -1618,13 +1668,25 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                     </MenuItem>
                   ))}
                 </TextField>
+                {imagesError && (
+                  <Button
+                    onClick={() => setImageReload((value) => value + 1)}
+                    disabled={loadingImages}
+                  >
+                    重新加载镜像
+                  </Button>
+                )}
               </div>
             </Panel>
             <Panel
               title="02 · 计算与存储"
               action={
                 <Button
-                  disabled={!accountId || busy}
+                  disabled={
+                    !accountId ||
+                    busy ||
+                    !locations.some((region) => region.name === form.location)
+                  }
                   size="small"
                   onClick={loadSkus}
                   startIcon={<RefreshCw size={15} />}
@@ -1803,6 +1865,11 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                 variant="contained"
                 disabled={
                   busy ||
+                  operation.running ||
+                  !locations.some((region) => region.name === form.location) ||
+                  !images.some(
+                    (item) => imageValue(item) === imageValue(form.image),
+                  ) ||
                   !session.writesEnabled ||
                   !accountId ||
                   !form.name ||
@@ -1815,7 +1882,9 @@ function CreatePage({ session, notify, navigate }: PageProps) {
               >
                 {busy ? "处理中…" : "创建虚拟机"}
               </Button>
-              <p className="page-note">部署进度将在任务中心持续更新。</p>
+              <p className="page-note">
+                创建后留在当前页面显示进度，成功后自动同步资源；任务中心也会保留记录。
+              </p>
             </Paper>
           </aside>
         </div>
@@ -1874,6 +1943,8 @@ function ExplorePage({
   const [account, setAccount] = useState(""),
     [region, setRegion] = useState(""),
     [regions, setRegions] = useState<Location[]>([]),
+    [loadingRegions, setLoadingRegions] = useState(false),
+    [regionError, setRegionError] = useState(""),
     [data, setData] = useState<Json[] | null>(null),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
@@ -1894,20 +1965,34 @@ function ExplorePage({
   }, [account, region, mode]);
   // Region list comes from the selected account.
   useEffect(() => {
-    if (!account) return;
+    setRegions([]);
+    setRegionError("");
+    if (!account || mode !== "quota") {
+      setLoadingRegions(false);
+      return;
+    }
     let current = true;
+    setLoadingRegions(true);
     api<Location[]>(`/accounts/${account}/locations`)
       .then((list) => {
         if (!current) return;
         setRegions(list);
-        if (!list.some((location) => location.name === region))
-          setRegion(list[0]?.name ?? "");
+        setRegion((previous) =>
+          list.some((item) => item.name === previous)
+            ? previous
+            : (list[0]?.name ?? ""),
+        );
       })
-      .catch(() => current && setRegions([]));
+      .catch((error) => {
+        if (current) setRegionError(error.message);
+      })
+      .finally(() => {
+        if (current) setLoadingRegions(false);
+      });
     return () => {
       current = false;
     };
-  }, [account]);
+  }, [account, mode]);
   async function load() {
     setBusy(true);
     setError("");
@@ -1954,23 +2039,22 @@ function ExplorePage({
           ))}
         </TextField>
         {mode === "quota" && (
-          <TextField
-            select
-            label="区域"
+          <RegionSelect
+            regions={regions}
             value={region}
-            onChange={(e) => setRegion(e.target.value)}
-            disabled={!regions.length}
-          >
-            {regions.map((location) => (
-              <MenuItem key={location.name} value={location.name}>
-                {location.displayName} · {location.name}
-              </MenuItem>
-            ))}
-          </TextField>
+            onChange={setRegion}
+            loading={loadingRegions}
+            error={regionError}
+          />
         )}
         <Button
           variant="contained"
-          disabled={!account || busy}
+          disabled={
+            !account ||
+            busy ||
+            (mode === "quota" &&
+              (loadingRegions || !regions.some((item) => item.name === region)))
+          }
           onClick={load}
           startIcon={<Search size={17} />}
         >

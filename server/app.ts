@@ -28,7 +28,6 @@ import { avatarUrl } from "./avatar.js";
 import { hashPassword, hashToken, verifyPassword } from "./security.js";
 import type { Config } from "./config.js";
 import { Azure, RequestGate, selectSubscription } from "./azure.js";
-import { fallbackImages } from "../shared/images.js";
 import { Tasks } from "./tasks.js";
 import { AzureAi } from "./azure-ai.js";
 import { AzureBilling } from "./azure-billing.js";
@@ -426,12 +425,7 @@ export async function buildApp(
   app.get("/api/accounts/:id/images", async (request) => {
     const { account, credentials } = accountContext(request);
     const { region } = z.object({ region: regionSchema }).parse(request.query);
-    try {
-      return await azure.imageOptions(credentials, account, region);
-    } catch {
-      // Fall back to the curated defaults so the page still works offline.
-      return fallbackImages;
-    }
+    return azure.imageOptions(credentials, account, region);
   });
   app.get("/api/accounts/:id/skus", async (request) => {
     const { account, credentials } = accountContext(request);
@@ -445,7 +439,10 @@ export async function buildApp(
   });
   app.get("/api/accounts/:id/ai/services", async (request) => {
     const { account, credentials } = accountContext(request);
-    return ai.services(credentials, account);
+    const { refresh } = z
+      .object({ refresh: z.enum(["true", "false"]).optional() })
+      .parse(request.query);
+    return ai.services(credentials, account, refresh === "true");
   });
   app.post("/api/accounts/:id/ai/services", async (request) => {
     checkWrites();
@@ -476,6 +473,9 @@ export async function buildApp(
       credentials,
       account,
       aiServiceSchema.parse(request.query),
+      z
+        .object({ refresh: z.enum(["true", "false"]).optional() })
+        .parse(request.query).refresh === "true",
     );
   });
   app.get("/api/accounts/:id/ai/usages", async (request) => {
@@ -722,6 +722,12 @@ export async function buildApp(
     };
   });
   app.get("/api/tasks", async (request) => store.tasks(user(request).id));
+  app.get("/api/tasks/:id", async (request) => {
+    const { id } = idParams.parse(request.params);
+    const task = store.task(user(request).id, id);
+    if (!task) throw new AppError(404, "任务不存在");
+    return task;
+  });
   app.get("/api/presets", async (request) => store.presets(user(request).id));
   app.post("/api/presets", async (request) => {
     const input = presetSchema.parse(request.body);

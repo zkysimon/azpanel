@@ -224,13 +224,9 @@ test("image listing reads SKUs live from Azure and skips regions without a publi
     async (url) => {
       requested.push(String(url));
       if (String(url).includes("debian-12"))
-        return response({
-          value: [{ name: "12-gen2" }, { name: "12-gen1" }],
-        });
+        return response([{ name: "12-gen2" }, { name: "12-gen1" }]);
       if (String(url).includes("WindowsServer"))
-        return response({
-          value: [{ name: "2022-datacenter-smalldisk-g2" }],
-        });
+        return response([{ name: "2022-datacenter-smalldisk-g2" }]);
       return response({ error: { code: "NotFound" } }, 404);
     },
     async () => "token",

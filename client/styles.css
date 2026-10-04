@@ -652,6 +652,13 @@ button {
   font-size: 12px;
   overflow-wrap: anywhere;
 }
+.inline-task {
+  margin-bottom: 20px;
+}
+.inline-task strong {
+  display: block;
+  margin-bottom: 6px;
+}
 .billing-card {
   border-radius: 14px;
   padding: 14px;

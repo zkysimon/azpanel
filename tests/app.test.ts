@@ -130,6 +130,16 @@ test("session, CSRF, tenant isolation, read-only gate, credential encryption, an
       store.tasks(session.user.id).find((task) => task.id === taskId)?.status,
       "succeeded",
     );
+    assert.equal(
+      (await app.inject({ url: `/api/tasks/${taskId}`, headers })).json()
+        .status,
+      "succeeded",
+    );
+    assert.equal(
+      (await app.inject({ url: `/api/tasks/${taskId}`, headers: otherHeaders }))
+        .statusCode,
+      404,
+    );
     await app.inject({ method: "POST", url: "/api/logout", headers });
     assert.equal(
       (await app.inject({ url: "/api/accounts", headers })).statusCode,

@@ -1,4 +1,5 @@
 import { Azure, AzureError } from "./azure.js";
+import { createHash } from "node:crypto";
 import { AppError } from "./store.js";
 import type { Account, Credentials } from "../shared/types.js";
 import type {
@@ -17,39 +18,68 @@ export class AzureAi {
   private root(account: Account, service: AiServiceRef) {
     return `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(service.group)}/providers/Microsoft.CognitiveServices/accounts/${encodeURIComponent(service.name)}`;
   }
+  private key(
+    credentials: Credentials,
+    account: Account,
+    kind: string,
+    service?: AiServiceRef,
+  ) {
+    const identity = createHash("sha256")
+      .update(JSON.stringify(credentials))
+      .digest("hex");
+    return `ai:${account.id}:${identity}:${kind}${service ? ":" + this.root(account, service).toLowerCase() : ""}`;
+  }
   async services(
     credentials: Credentials,
     account: Account,
+    fresh = false,
   ): Promise<AiService[]> {
-    const values = await this.azure.list(
-      credentials,
-      `/subscriptions/${account.subscriptionId}/providers/Microsoft.CognitiveServices/accounts?api-version=${version}`,
-    );
-    return values
-      .filter((item) => ["OpenAI", "AIServices"].includes(item.kind))
-      .map((item) => ({
-        id: item.id,
-        group: item.id.split("/")[4],
-        name: item.name,
-        kind: item.kind,
-        location: item.location,
-        state: item.properties?.provisioningState ?? "Unknown",
-        endpoint: item.properties?.endpoint ?? null,
-      }));
+    const key = this.key(credentials, account, "services");
+    if (fresh) this.azure.invalidateCache(key);
+    return this.azure.cached(key, 60000, async () => {
+      const values = await this.azure.list(
+        credentials,
+        `/subscriptions/${account.subscriptionId}/providers/Microsoft.CognitiveServices/accounts?api-version=${version}`,
+      );
+      return values
+        .filter((item) => ["OpenAI", "AIServices"].includes(item.kind))
+        .map((item) => {
+          const ref = { group: item.id.split("/")[4], name: item.name };
+          this.azure.primeCache(
+            this.key(credentials, account, "service", ref),
+            item,
+            60000,
+          );
+          return {
+            id: item.id,
+            group: item.id.split("/")[4],
+            name: item.name,
+            kind: item.kind,
+            location: item.location,
+            state: item.properties?.provisioningState ?? "Unknown",
+            endpoint: item.properties?.endpoint ?? null,
+          };
+        });
+    });
   }
   private async verifyService(
     credentials: Credentials,
     account: Account,
     service: AiServiceRef,
+    fresh = false,
   ) {
-    const { data } = await this.azure.request(
-      credentials,
-      "GET",
-      `${this.root(account, service)}?api-version=${version}`,
-    );
-    if (!["OpenAI", "AIServices"].includes(data.kind))
-      throw new AppError(422, "请选择 Azure OpenAI 或 AI Services 资源");
-    return data;
+    const key = this.key(credentials, account, "service", service);
+    if (fresh) this.azure.invalidateCache(key);
+    return this.azure.cached(key, 60000, async () => {
+      const { data } = await this.azure.request(
+        credentials,
+        "GET",
+        `${this.root(account, service)}?api-version=${version}`,
+      );
+      if (!["OpenAI", "AIServices"].includes(data.kind))
+        throw new AppError(422, "请选择 Azure OpenAI 或 AI Services 资源");
+      return data;
+    });
   }
   async models(
     credentials: Credentials,
@@ -57,7 +87,7 @@ export class AzureAi {
     service: AiServiceRef,
     fresh = false,
   ): Promise<AiModel[]> {
-    const key = `ai-models:${account.id}:${service.group.toLowerCase()}:${service.name.toLowerCase()}`;
+    const key = this.key(credentials, account, "models", service);
     if (fresh) this.azure.invalidateCache(key);
     return this.azure.cached(key, 3600000, async () => {
       await this.verifyService(credentials, account, service);
@@ -83,6 +113,13 @@ export class AzureAi {
               maximum: sku.capacity?.maximum ?? item.maxCapacity ?? null,
               step: sku.capacity?.step ?? 1,
               default: sku.capacity?.default ?? sku.capacity?.minimum ?? 1,
+              azureDefault: sku.capacity?.default ?? null,
+              defaultSource:
+                sku.capacity?.default != null
+                  ? "azure"
+                  : sku.capacity?.minimum != null
+                    ? "minimum"
+                    : "fallback",
               allowedValues: sku.capacity?.allowedValues ?? [],
             })),
         }));
@@ -92,43 +129,54 @@ export class AzureAi {
     credentials: Credentials,
     account: Account,
     service: AiServiceRef,
+    fresh = false,
   ): Promise<AiDeployment[]> {
-    await this.verifyService(credentials, account, service);
-    return (
-      await this.azure.list(
-        credentials,
-        `${this.root(account, service)}/deployments?api-version=${version}`,
-      )
-    ).map((item) => ({
-      name: item.name,
-      model: {
-        format: item.properties?.model?.format ?? "",
-        name: item.properties?.model?.name ?? "",
-        version: item.properties?.model?.version ?? "",
-      },
-      sku: item.sku?.name ?? "",
-      capacity: item.sku?.capacity ?? 0,
-      state: item.properties?.provisioningState ?? "Unknown",
-    }));
+    const key = this.key(credentials, account, "deployments", service);
+    if (fresh) this.azure.invalidateCache(key);
+    return this.azure.cached(key, 15000, async () => {
+      await this.verifyService(credentials, account, service);
+      return (
+        await this.azure.list(
+          credentials,
+          `${this.root(account, service)}/deployments?api-version=${version}`,
+        )
+      ).map((item) => ({
+        name: item.name,
+        model: {
+          format: item.properties?.model?.format ?? "",
+          name: item.properties?.model?.name ?? "",
+          version: item.properties?.model?.version ?? "",
+        },
+        sku: item.sku?.name ?? "",
+        capacity: item.sku?.capacity ?? 0,
+        state: item.properties?.provisioningState ?? "Unknown",
+      }));
+    });
   }
   async usages(
     credentials: Credentials,
     account: Account,
     service: AiServiceRef,
   ): Promise<AiUsage[]> {
-    await this.verifyService(credentials, account, service);
-    return (
-      await this.azure.list(
-        credentials,
-        `${this.root(account, service)}/usages?api-version=${version}`,
-      )
-    ).map((item) => ({
-      name: item.name?.value ?? "",
-      label: item.name?.localizedValue ?? item.name?.value ?? "",
-      current: item.currentValue ?? 0,
-      limit: item.limit ?? 0,
-      unit: item.unit ?? "",
-    }));
+    return this.azure.cached(
+      this.key(credentials, account, "usages", service),
+      60000,
+      async () => {
+        await this.verifyService(credentials, account, service);
+        return (
+          await this.azure.list(
+            credentials,
+            `${this.root(account, service)}/usages?api-version=${version}`,
+          )
+        ).map((item) => ({
+          name: item.name?.value ?? "",
+          label: item.name?.localizedValue ?? item.name?.value ?? "",
+          current: item.currentValue ?? 0,
+          limit: item.limit ?? 0,
+          unit: item.unit ?? "",
+        }));
+      },
+    );
   }
   async createService(
     credentials: Credentials,
@@ -166,22 +214,29 @@ export class AzureAi {
       );
     }
     progress("创建 AI 服务资源");
-    await this.azure.operation(
-      credentials,
-      "PUT",
-      `${this.root(account, input)}?api-version=${version}`,
-      {
-        kind: input.kind,
-        location: input.location,
-        sku: { name: "S0" },
-        properties: {
-          customSubDomainName: input.name,
-          publicNetworkAccess: "Enabled",
+    try {
+      await this.azure.operation(
+        credentials,
+        "PUT",
+        `${this.root(account, input)}?api-version=${version}`,
+        {
+          kind: input.kind,
+          location: input.location,
+          sku: { name: "S0" },
+          properties: {
+            customSubDomainName: input.name,
+            publicNetworkAccess: "Enabled",
+          },
+          tags: { managedBy: "azpanel" },
         },
-        tags: { managedBy: "azpanel" },
-      },
-      progress,
-    );
+        progress,
+      );
+    } finally {
+      this.azure.invalidateCache(this.key(credentials, account, "services"));
+      this.azure.invalidateCache(
+        this.key(credentials, account, "service", input),
+      );
+    }
   }
   async deploy(
     credentials: Credentials,
@@ -190,6 +245,7 @@ export class AzureAi {
     progress: (message: string) => void,
   ) {
     progress("检查模型版本、部署类型和容量");
+    await this.verifyService(credentials, account, input, true);
     const model = (await this.models(credentials, account, input, true)).find(
       (item) =>
         item.format === input.model.format &&
@@ -210,7 +266,12 @@ export class AzureAi {
     ) {
       throw new AppError(422, "容量不符合 Azure 返回的允许范围或步长");
     }
-    const deployments = await this.deployments(credentials, account, input);
+    const deployments = await this.deployments(
+      credentials,
+      account,
+      input,
+      true,
+    );
     if (
       deployments.some(
         (item) => item.name.toLowerCase() === input.deployment.toLowerCase(),
@@ -218,16 +279,25 @@ export class AzureAi {
     )
       throw new AppError(409, "部署名称已存在，请使用新名称");
     progress(`部署 ${input.model.name} · ${input.model.version}`);
-    await this.azure.operation(
-      credentials,
-      "PUT",
-      `${this.root(account, input)}/deployments/${encodeURIComponent(input.deployment)}?api-version=${version}`,
-      {
-        sku: { name: input.sku, capacity: input.capacity },
-        properties: { model: input.model },
-      },
-      progress,
-    );
+    try {
+      await this.azure.operation(
+        credentials,
+        "PUT",
+        `${this.root(account, input)}/deployments/${encodeURIComponent(input.deployment)}?api-version=${version}`,
+        {
+          sku: { name: input.sku, capacity: input.capacity },
+          properties: { model: input.model },
+        },
+        progress,
+      );
+    } finally {
+      this.azure.invalidateCache(
+        this.key(credentials, account, "deployments", input),
+      );
+      this.azure.invalidateCache(
+        this.key(credentials, account, "usages", input),
+      );
+    }
   }
   async deleteDeployment(
     credentials: Credentials,
@@ -236,14 +306,23 @@ export class AzureAi {
     deployment: string,
     progress: (message: string) => void,
   ) {
-    await this.verifyService(credentials, account, service);
+    await this.verifyService(credentials, account, service, true);
     progress(`删除模型部署 ${deployment}`);
-    await this.azure.operation(
-      credentials,
-      "DELETE",
-      `${this.root(account, service)}/deployments/${encodeURIComponent(deployment)}?api-version=${version}`,
-      undefined,
-      progress,
-    );
+    try {
+      await this.azure.operation(
+        credentials,
+        "DELETE",
+        `${this.root(account, service)}/deployments/${encodeURIComponent(deployment)}?api-version=${version}`,
+        undefined,
+        progress,
+      );
+    } finally {
+      this.azure.invalidateCache(
+        this.key(credentials, account, "deployments", service),
+      );
+      this.azure.invalidateCache(
+        this.key(credentials, account, "usages", service),
+      );
+    }
   }
 }

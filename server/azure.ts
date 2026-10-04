@@ -19,6 +19,7 @@ import {
   type ImageRef,
 } from "../shared/images.js";
 import { AppError } from "./store.js";
+import { regionGroup, sortRegions } from "../shared/regions.js";
 
 const ARM = "https://management.azure.com";
 const compute = "2024-11-01";
@@ -93,6 +94,7 @@ export class Azure {
   private identities = new Map<string, ClientSecretCredential>();
   private cache = new Map<string, { expires: number; value: unknown }>();
   private loading = new Map<string, Promise<unknown>>();
+  private cacheEpoch = new Map<string, number>();
   constructor(
     readonly gate = new RequestGate(),
     private transport: Transport = fetch,
@@ -323,6 +325,13 @@ export class Azure {
   }
   invalidateCache(key: string) {
     this.cache.delete(key);
+    this.loading.delete(key);
+    this.cacheEpoch.set(key, (this.cacheEpoch.get(key) ?? 0) + 1);
+  }
+  primeCache(key: string, value: unknown, ttl: number) {
+    this.invalidateCache(key);
+    if (this.cache.size > 500) this.cache.clear();
+    this.cache.set(key, { value, expires: Date.now() + ttl });
   }
   async cached<T>(
     key: string,
@@ -333,13 +342,17 @@ export class Azure {
     if (cached && cached.expires > Date.now()) return cached.value as T;
     const pending = this.loading.get(key);
     if (pending) return pending as Promise<T>;
+    const epoch = this.cacheEpoch.get(key) ?? 0;
     const promise = load()
       .then((value) => {
         if (this.cache.size > 500) this.cache.clear();
-        this.cache.set(key, { value, expires: Date.now() + ttl });
+        if ((this.cacheEpoch.get(key) ?? 0) === epoch)
+          this.cache.set(key, { value, expires: Date.now() + ttl });
         return value;
       })
-      .finally(() => this.loading.delete(key));
+      .finally(() => {
+        if (this.loading.get(key) === promise) this.loading.delete(key);
+      });
     this.loading.set(key, promise);
     return promise;
   }
@@ -349,17 +362,25 @@ export class Azure {
         credentials,
         `/subscriptions/${account.subscriptionId}/locations?api-version=2022-12-01`,
       );
-      return data
-        .filter((location) => location.name && location.displayName)
-        .map((location) => ({
-          name: String(location.name),
-          displayName: String(location.displayName),
-          regionalDisplayName: String(
-            location.regionalDisplayName ?? location.displayName,
-          ),
-          geography: String(location.metadata?.geography ?? ""),
-        }))
-        .sort((a, b) => a.displayName.localeCompare(b.displayName, "en"));
+      return sortRegions(
+        data
+          .filter(
+            (location) =>
+              location.name &&
+              location.displayName &&
+              location.metadata?.regionType === "Physical",
+          )
+          .map((location) => ({
+            name: String(location.name),
+            displayName: String(location.displayName),
+            regionalDisplayName: String(
+              location.regionalDisplayName ?? location.displayName,
+            ),
+            geography: String(location.metadata?.geography ?? ""),
+            geographyGroup: String(location.metadata?.geographyGroup ?? ""),
+            continent: regionGroup(location.metadata ?? {}),
+          })),
+      );
     });
   }
   /** Reads each curated offer's SKUs live from Azure. Cached 24h per account+region. */
@@ -373,7 +394,8 @@ export class Azure {
       const options: ImageOption[] = [];
       for (const target of imageTargets) {
         try {
-          const skus = await this.list(
+          // Compute image catalog APIs return a bare array, unlike ARM resource lists.
+          const skus = await this.imageCatalogList(
             credentials,
             `${base}/${target.publisher}/artifacttypes/vmimage/offers/${target.offer}/skus?api-version=2024-11-01`,
           );
@@ -410,16 +432,53 @@ export class Azure {
       );
     });
   }
-  /** Confirms the selected publisher/offer/sku exists in the region before deploying. */
+  private async imageCatalogList(
+    credentials: Credentials,
+    path: string,
+  ): Promise<Json[]> {
+    const { data } = await this.request(credentials, "GET", path);
+    if (
+      !Array.isArray(data) ||
+      !data.every((item) => typeof item.name === "string")
+    )
+      throw new AppError(502, "Azure 镜像目录响应格式无效");
+    return data;
+  }
+  /** Image GET requires /versions/{version}; /skus/{sku} is not a valid GET endpoint. */
   async assertImageAvailable(
     credentials: Credentials,
     account: Account,
     region: string,
     image: ImageRef,
   ) {
-    const path = `/subscriptions/${account.subscriptionId}/providers/Microsoft.Compute/locations/${region}/publishers/${image.publisher}/artifacttypes/vmimage/offers/${image.offer}/skus/${image.sku}`;
+    const path = `/subscriptions/${account.subscriptionId}/providers/Microsoft.Compute/locations/${encodeURIComponent(region)}/publishers/${encodeURIComponent(image.publisher)}/artifacttypes/vmimage/offers/${encodeURIComponent(image.offer)}/skus/${encodeURIComponent(image.sku)}/versions`;
     try {
-      await this.request(credentials, "GET", `${path}?api-version=2024-11-01`);
+      let resolvedVersion = image.version;
+      if (resolvedVersion === "latest") {
+        const query = new URLSearchParams({
+          "api-version": compute,
+          $top: "1",
+          $orderby: "name desc",
+        });
+        const versions = await this.imageCatalogList(
+          credentials,
+          `${path}?${query}`,
+        );
+        if (!versions.length)
+          throw new AppError(422, "所选镜像在此区域没有可用版本");
+        resolvedVersion = versions[0].name;
+      }
+      const { data } = await this.request(
+        credentials,
+        "GET",
+        `${path}/${encodeURIComponent(resolvedVersion)}?api-version=${compute}`,
+      );
+      if (!data.properties?.osDiskImage || !data.properties?.hyperVGeneration)
+        throw new AppError(502, "Azure 镜像详情响应缺少架构或系统盘信息");
+      return {
+        reference: { ...image, version: resolvedVersion },
+        properties: data.properties,
+      };
     } catch (error) {
       if (error instanceof AzureError && error.azureStatus === 404)
         throw new AppError(
@@ -649,6 +708,16 @@ export class Azure {
     input: CreateVm,
     progress: (message: string) => void,
   ) {
+    progress("检查实体部署区域");
+    if (
+      !(await this.locations(credentials, account)).some(
+        (region) => region.name === input.location,
+      )
+    )
+      throw new AppError(
+        422,
+        "请选择 Azure 返回的实体部署区域，不能使用 asia 等逻辑区域",
+      );
     const sku = (await this.skus(credentials, account, input.location)).find(
       (sku) => sku.name === input.size,
     );
@@ -657,12 +726,27 @@ export class Azure {
     if (!sku.generations.includes("V2"))
       throw new AppError(422, "当前镜像需要支持 Gen2 的规格");
     progress("确认所选镜像在目标区域可用");
-    await this.assertImageAvailable(
+    const image = await this.assertImageAvailable(
       credentials,
       account,
       input.location,
       input.image,
     );
+    if (
+      image.properties.hyperVGeneration !== "V2" ||
+      String(image.properties.architecture ?? "x64").toLowerCase() !== "x64"
+    )
+      throw new AppError(422, "当前创建配置仅支持 Gen2 x64 镜像，请更换镜像");
+    if (input.diskSize < Number(image.properties.osDiskImage.sizeInGb ?? 0))
+      throw new AppError(
+        422,
+        `所选镜像的系统盘至少需要 ${image.properties.osDiskImage.sizeInGb} GiB`,
+      );
+    if (image.properties.purchasePlan)
+      throw new AppError(
+        422,
+        "所选 Marketplace 镜像需要购买计划，请通过 Azure Portal 接受条款并部署，或选择无购买计划的镜像",
+      );
     const root = `/subscriptions/${account.subscriptionId}/resourceGroups/${input.name}-azpanel`;
     const groups = await this.groups(credentials, account);
     if (
@@ -707,7 +791,7 @@ export class Azure {
           );
       }
     }
-    const deployment = deploymentTemplate(input);
+    const deployment = deploymentTemplate({ ...input, image: image.reference });
     progress("创建独立资源组");
     await this.operation(
       credentials,
@@ -945,7 +1029,7 @@ export function deploymentTemplate(input: CreateVm) {
       properties: {
         hardwareProfile: { vmSize: input.size },
         storageProfile: {
-          imageReference: { ...image, version: "latest" },
+          imageReference: image,
           osDisk: {
             createOption: "FromImage",
             diskSizeGB: input.diskSize,

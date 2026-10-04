@@ -24,6 +24,81 @@ const model = {
   ],
 };
 
+test("AI landing needs only service list and deployments; catalog checks share cached verification", async () => {
+  const urls: string[] = [];
+  const azure = new Azure(
+    new RequestGate(0),
+    async (url) => {
+      const path = new URL(String(url)).pathname;
+      urls.push(path);
+      if (path.endsWith("/accounts"))
+        return Response.json({
+          value: [
+            {
+              id: aiRoot,
+              name: service.name,
+              kind: "OpenAI",
+              location: "eastus",
+            },
+          ],
+        });
+      if (path.endsWith("/models")) return Response.json({ value: [model] });
+      if (path.endsWith("/deployments") || path.endsWith("/usages"))
+        return Response.json({ value: [] });
+      throw new Error("Unexpected duplicate service verification");
+    },
+    async () => "token",
+  );
+  const ai = new AzureAi(azure);
+  await ai.services(credentials, account);
+  await ai.deployments(credentials, account, service);
+  assert.equal(urls.length, 2);
+  await Promise.all([
+    ai.models(credentials, account, service),
+    ai.usages(credentials, account, service),
+  ]);
+  assert.equal(urls.length, 4);
+  await ai.services(credentials, account);
+  await ai.deployments(credentials, account, service);
+  await ai.usages(credentials, account, service);
+  assert.equal(urls.length, 4);
+  await ai.deployments(credentials, account, service, true);
+  assert.equal(urls.length, 5);
+});
+
+test("AI capacity explicitly distinguishes Azure defaults from minimum and fallback values", async () => {
+  const azure = new Azure(
+    new RequestGate(0),
+    async (url) =>
+      String(url).includes("/models?")
+        ? Response.json({
+            value: [
+              {
+                ...model,
+                skus: [
+                  { name: "Default", capacity: { minimum: 1, default: 5 } },
+                  { name: "MinOnly", capacity: { minimum: 10 } },
+                  { name: "Neither" },
+                ],
+              },
+            ],
+          })
+        : Response.json({ kind: "OpenAI" }),
+    async () => "token",
+  );
+  const skus = (
+    await new AzureAi(azure).models(credentials, account, service)
+  )[0].skus;
+  assert.deepEqual(
+    skus.map((sku) => [sku.default, sku.azureDefault, sku.defaultSource]),
+    [
+      [5, 5, "azure"],
+      [10, null, "minimum"],
+      [1, null, "fallback"],
+    ],
+  );
+});
+
 test("AI models use the service catalog, validate capacity, preserve chosen version, and delete only a deployment", async () => {
   const requests: { url: string; method: string; body: any }[] = [];
   const azure = new Azure(
@@ -87,6 +162,15 @@ test("AI models use the service catalog, validate capacity, preserve chosen vers
     service,
     "chat-test",
     () => {},
+  );
+  const countBeforeRefresh = requests.filter((item) =>
+    item.url.includes("/deployments?"),
+  ).length;
+  await ai.deployments(credentials, account, service);
+  assert.equal(
+    requests.filter((item) => item.url.includes("/deployments?")).length,
+    countBeforeRefresh + 1,
+    "deleting a deployment must invalidate its cached list",
   );
   assert.ok(
     requests
