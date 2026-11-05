@@ -3,7 +3,7 @@ import cookie from "@fastify/cookie";
 import rateLimit from "@fastify/rate-limit";
 import staticFiles from "@fastify/static";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, relative } from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type {
@@ -47,6 +47,9 @@ declare module "fastify" {
 }
 const idParams = z.object({ id: z.string().min(1).max(128) });
 const confirmationSchema = z.object({ confirmation: z.string() });
+const refreshSchema = z.object({
+  refresh: z.enum(["true", "false"]).optional(),
+});
 export async function buildApp(
   config: Config,
   supplied?: { store?: Store; azure?: Azure },
@@ -55,7 +58,7 @@ export async function buildApp(
   const azure =
     supplied?.azure ?? new Azure(new RequestGate(config.azureInterval));
   const tasks = new Tasks(store);
-  const ai = new AzureAi(azure);
+  const ai = new AzureAi(azure, store);
   const billing = new AzureBilling(azure);
   const billingLoads = new Map<string, Promise<BillingSummary>>();
   const app = Fastify({ logger: false, bodyLimit: 100_000, trustProxy: false });
@@ -439,9 +442,7 @@ export async function buildApp(
   });
   app.get("/api/accounts/:id/ai/services", async (request) => {
     const { account, credentials } = accountContext(request);
-    const { refresh } = z
-      .object({ refresh: z.enum(["true", "false"]).optional() })
-      .parse(request.query);
+    const { refresh } = refreshSchema.parse(request.query);
     return ai.services(credentials, account, refresh === "true");
   });
   app.post("/api/accounts/:id/ai/services", async (request) => {
@@ -465,6 +466,7 @@ export async function buildApp(
       credentials,
       account,
       aiServiceSchema.parse(request.query),
+      refreshSchema.parse(request.query).refresh === "true",
     );
   });
   app.get("/api/accounts/:id/ai/deployments", async (request) => {
@@ -473,9 +475,7 @@ export async function buildApp(
       credentials,
       account,
       aiServiceSchema.parse(request.query),
-      z
-        .object({ refresh: z.enum(["true", "false"]).optional() })
-        .parse(request.query).refresh === "true",
+      refreshSchema.parse(request.query).refresh === "true",
     );
   });
   app.get("/api/accounts/:id/ai/usages", async (request) => {
@@ -484,6 +484,7 @@ export async function buildApp(
       credentials,
       account,
       aiServiceSchema.parse(request.query),
+      refreshSchema.parse(request.query).refresh === "true",
     );
   });
   app.post("/api/accounts/:id/ai/deployments", async (request) => {
@@ -902,7 +903,18 @@ export async function buildApp(
   });
   const staticRoot = resolve("dist/client");
   if (existsSync(staticRoot)) {
-    await app.register(staticFiles, { root: staticRoot });
+    await app.register(staticFiles, {
+      root: staticRoot,
+      setHeaders(response, path) {
+        const asset = relative(staticRoot, path).replaceAll("\\", "/");
+        response.header(
+          "Cache-Control",
+          asset.startsWith("assets/")
+            ? "public, max-age=31536000, immutable"
+            : "no-cache",
+        );
+      },
+    });
     app.setNotFoundHandler((request, reply) =>
       request.url.startsWith("/api/")
         ? reply.status(404).send({ error: "接口不存在" })

@@ -4,6 +4,7 @@ import React, {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { createRoot } from "react-dom/client";
@@ -107,11 +108,11 @@ import { api, setCsrf } from "./api.js";
 import { makeTheme } from "./theme.js";
 import "./styles.css";
 import BillingCard from "./BillingCard.js";
-import AiPage from "./AiPage.js";
 import RegionSelect from "./RegionSelect.js";
 import InlineTask from "./InlineTask.js";
 import { useInlineTask } from "./useInlineTask.js";
 const MetricsChart = lazy(() => import("./MetricsChart.js"));
+const AiPage = lazy(() => import("./AiPage.js"));
 
 type Page =
   | "overview"
@@ -219,22 +220,28 @@ function Panel({
   );
 }
 function useLoad<T>(loader: () => Promise<T>, deps: unknown[]) {
+  const sequence = useRef(0);
   const [data, setData] = useState<T | null>(null),
     [error, setError] = useState(""),
     [loading, setLoading] = useState(true);
   const reload = useCallback(async () => {
+    const id = ++sequence.current;
     setLoading(true);
     setError("");
     try {
-      setData(await loader());
+      const result = await loader();
+      if (id === sequence.current) setData(result);
     } catch (e) {
-      setError((e as Error).message);
+      if (id === sequence.current) setError((e as Error).message);
     } finally {
-      setLoading(false);
+      if (id === sequence.current) setLoading(false);
     }
   }, deps);
   useEffect(() => {
     void reload();
+    return () => {
+      sequence.current++;
+    };
   }, [reload]);
   return { data, error, loading, reload };
 }
@@ -2331,16 +2338,19 @@ function ExplorePage({
 }
 
 function TasksPage({ revision }: PageProps) {
-  const { data, error, reload } = useLoad(
+  const { data, error, loading, reload } = useLoad(
     () => api<Task[]>("/tasks"),
     [revision],
   );
   useEffect(() => {
-    if (!data?.some((task) => ["queued", "running"].includes(task.status)))
+    if (
+      loading ||
+      !data?.some((task) => ["queued", "running"].includes(task.status))
+    )
       return;
-    const timer = setInterval(reload, 5000);
-    return () => clearInterval(timer);
-  }, [data, reload]);
+    const timer = setTimeout(reload, 5000);
+    return () => clearTimeout(timer);
+  }, [data, loading, reload]);
   return (
     <>
       <Heading
@@ -3213,6 +3223,7 @@ function App() {
                       onClick={async () => {
                         try {
                           await api("/logout", "POST");
+                          setCsrf("");
                           setSession(null);
                         } catch (e) {
                           notify((e as Error).message);
@@ -3226,7 +3237,9 @@ function App() {
               </header>
               <main className="main-content" key={page}>
                 {page === "ai" ? (
-                  <AiPage {...props} />
+                  <Suspense fallback={<LinearProgress />}>
+                    <AiPage {...props} />
+                  </Suspense>
                 ) : page === "accounts" ? (
                   <AccountsPage {...props} />
                 ) : page === "machines" ? (

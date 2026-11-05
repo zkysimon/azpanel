@@ -39,12 +39,15 @@ export class Store {
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_results (task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS billing_cache (account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, data TEXT NOT NULL, expires_at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS ai_cache (key TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, data TEXT NOT NULL, expires_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS ai_cache_account ON ai_cache(account_id);
+      CREATE INDEX IF NOT EXISTS ai_cache_expiry ON ai_cache(expires_at);
       CREATE INDEX IF NOT EXISTS accounts_owner ON accounts(user_id);
       CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(user_id, created_at);
       CREATE INDEX IF NOT EXISTS audit_owner ON audit(user_id, created_at);
       CREATE INDEX IF NOT EXISTS presets_owner ON presets(user_id, updated_at);
       INSERT OR IGNORE INTO settings(key,value) VALUES('registration_open','0');
-      PRAGMA user_version=5;`);
+      PRAGMA user_version=6;`);
     // Additive migration for databases created before user management existed.
     const userColumns = (
       this.db.prepare("PRAGMA table_info(users)").all() as { name: string }[]
@@ -61,6 +64,7 @@ export class Store {
     this.db
       .prepare("DELETE FROM sessions WHERE expires_at < ?")
       .run(Date.now());
+    this.db.prepare("DELETE FROM ai_cache WHERE expires_at<=?").run(Date.now());
     if (!this.db.prepare("SELECT id FROM users LIMIT 1").get()) {
       if (!config.adminEmail || config.adminPassword.length < 12)
         throw new Error(

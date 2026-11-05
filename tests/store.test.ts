@@ -69,7 +69,7 @@ test("database restart retains encrypted accounts, marks jobs interrupted, and r
           user_version: number;
         }
       ).user_version,
-      5,
+      6,
     );
     store.db.prepare("DELETE FROM accounts WHERE id=?").run(account.id);
     assert.equal(

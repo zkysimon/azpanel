@@ -6,7 +6,15 @@ test("mobile members, credit card, multi-delete and AI deployments work together
 }) => {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.goto("http://127.0.0.1:3001/");
+  const documentResponse = await page.goto("http://127.0.0.1:3001/");
+  expect(documentResponse!.headers()["cache-control"]).toBe("no-cache");
+  const script = await page
+    .locator('script[type="module"]')
+    .getAttribute("src");
+  const asset = await page.request.get(new URL(script!, page.url()).href);
+  expect(asset.headers()["cache-control"]).toBe(
+    "public, max-age=31536000, immutable",
+  );
   await page
     .getByRole("textbox", { name: "邮箱", exact: true })
     .fill(testConfig.adminEmail);
@@ -66,6 +74,16 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   await page.getByRole("option", { name: /gpt-test/ }).click();
   await expect(dialog.getByText(/Azure 默认值：1/)).toBeVisible();
   await expect(dialog.getByLabel("容量单位")).toHaveValue("1");
+  const modelReads = () =>
+    aiReads.filter((url) => url.includes("/models?")).length;
+  const initialModelReads = modelReads();
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await page.getByRole("button", { name: "部署模型", exact: true }).click();
+  await expect(dialog.getByLabel("模型与版本")).toBeEnabled();
+  await dialog.getByLabel("模型与版本").click();
+  await page.getByRole("option", { name: /gpt-test/ }).click();
+  expect(modelReads()).toBe(initialModelReads);
+  expect(aiReads.filter((url) => url.includes("/usages?")).length).toBe(1);
   // Deliberately leave quota pending: the dialog must be usable independently.
   await expect(dialog.getByText(/正在后台读取配额/)).toBeVisible();
   await dialog.getByLabel("部署名称", { exact: true }).fill("browser-model");
@@ -96,10 +114,53 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   await expect(page.getByRole("cell", { name: "browser-model" })).toHaveCount(
     0,
   );
+  // Forced refresh must not become a sticky mode on navigation or reopening.
+  await page.getByRole("button", { name: "刷新 AI 服务" }).click();
+  await expect(
+    page.getByRole("button", { name: "刷新 AI 服务" }),
+  ).toBeEnabled();
+  const readsAfterRefresh = aiReads.length;
+  await page.locator("nav").getByRole("button", { name: "任务中心" }).click();
+  await page.locator("nav").getByRole("button", { name: "AI 模型" }).click();
+  await page.getByLabel("Azure 账户").click();
+  await page.getByRole("option", { name: "开发工作空间" }).click();
+  await expect(page.getByText("还没有部署模型")).toBeVisible();
+  expect(aiReads.length).toBe(readsAfterRefresh);
   // Failed deployment stays on the same page and reports the server error.
   await page.getByRole("button", { name: "部署模型", exact: true }).click();
+  await expect(dialog.getByLabel("模型与版本")).toBeEnabled();
+  expect(modelReads()).toBe(initialModelReads);
+  await dialog.getByRole("button", { name: "刷新模型目录" }).click();
+  await expect(
+    dialog.getByRole("button", { name: "刷新模型目录" }),
+  ).toBeEnabled();
+  expect(modelReads()).toBe(initialModelReads + 1);
+  expect(
+    aiReads.some(
+      (url) => url.includes("/models?") && url.includes("refresh=true"),
+    ),
+  ).toBe(true);
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  // Expired snapshots remain usable even when the replacement request is slow.
+  let releaseModels: () => void = () => {};
+  const blockedModels = new Promise<void>((resolve) => {
+    releaseModels = resolve;
+  });
+  await page.route("**/ai/models?**", async (route) => {
+    await blockedModels;
+    await route.continue();
+  });
+  await page.clock.setFixedTime(new Date(Date.now() + 61 * 60_000));
+  await page.getByRole("button", { name: "部署模型", exact: true }).click();
+  await expect(dialog.getByText("正在后台更新模型目录…")).toBeVisible();
+  await expect(dialog.getByLabel("模型与版本")).toBeEnabled();
   await dialog.getByLabel("模型与版本").click();
   await page.getByRole("option", { name: /gpt-test/ }).click();
+  releaseModels();
+  await expect(
+    dialog.getByRole("button", { name: "刷新模型目录" }),
+  ).toBeEnabled();
+  await page.clock.setFixedTime(new Date());
   await dialog.getByLabel("容量单位").fill("100");
   await dialog.getByLabel("部署名称", { exact: true }).fill("too-large");
   await dialog.getByLabel("输入部署名称确认").fill("too-large");
@@ -168,9 +229,7 @@ test("mobile members, credit card, multi-delete and AI deployments work together
     .getByRole("textbox", { name: "虚拟机名称", exact: true })
     .fill("edited-after-submit");
   releaseTask();
-  await expect(
-    page.getByRole("heading", { name: "虚拟机", exact: true }),
-  ).toBeVisible({ timeout: 15000 });
+  await expect(page).toHaveURL(/#machines\?/, { timeout: 15000 });
   const detail = page.getByRole("dialog");
   await expect(detail.getByText("browser-vm", { exact: true })).toBeVisible();
   await expect(detail.getByText("japaneast", { exact: true })).toBeVisible();

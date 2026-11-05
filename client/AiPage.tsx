@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Alert,
   Autocomplete,
@@ -21,7 +21,9 @@ import {
   TextField,
 } from "@mui/material";
 import { Bot, ExternalLink, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { api } from "./api.js";
+import { api, invalidateApiCache } from "./api.js";
+import { useCachedApi } from "./useCachedApi.js";
+import { aiCacheTtl } from "../shared/ai-cache.js";
 import type { Account, Json, Location, Session } from "../shared/types.js";
 import InlineTask from "./InlineTask.js";
 import { useInlineTask } from "./useInlineTask.js";
@@ -42,21 +44,8 @@ const modelKey = (model: AiModel) =>
 export default function AiPage({ session, notify }: Props) {
   const [accounts, setAccounts] = useState<Account[]>([]),
     [accountId, setAccountId] = useState("");
-  const [services, setServices] = useState<AiService[]>([]),
-    [serviceId, setServiceId] = useState("");
-  const [models, setModels] = useState<AiModel[]>([]),
-    [deployments, setDeployments] = useState<AiDeployment[]>([]);
-  const [usage, setUsage] = useState<AiUsage[]>([]),
-    [usageError, setUsageError] = useState("");
-  const [loadingServices, setLoadingServices] = useState(false),
-    [loadingDeployments, setLoadingDeployments] = useState(false),
-    [loadingModels, setLoadingModels] = useState(false),
-    [loadingUsage, setLoadingUsage] = useState(false),
-    [modelError, setModelError] = useState(""),
-    [modelReload, setModelReload] = useState(0),
-    [deploymentRefresh, setDeploymentRefresh] = useState(0),
-    [error, setError] = useState(""),
-    [refresh, setRefresh] = useState(0);
+  const [serviceId, setServiceId] = useState("");
+  const [error, setError] = useState("");
   const [deployOpen, setDeployOpen] = useState(false),
     [model, setModel] = useState<AiModel | null>(null),
     [sku, setSku] = useState(""),
@@ -72,24 +61,61 @@ export default function AiPage({ session, notify }: Props) {
   const [newGroup, setNewGroup] = useState(""),
     [newLocation, setNewLocation] = useState(""),
     [newKind, setNewKind] = useState("OpenAI");
-  const service = services.find((item) => item.id === serviceId);
-  const selectedSku = model?.skus.find((item) => item.name === sku);
-  const usedQuota = selectedSku?.usageName
-    ? usage.find(
-        (item) =>
-          item.name.toLowerCase() === selectedSku.usageName!.toLowerCase(),
-      )
-    : undefined;
+  const base = accountId ? `/accounts/${accountId}/ai` : null;
+  const serviceList = useCachedApi<AiService[]>(
+    base ? `${base}/services` : null,
+    aiCacheTtl.services,
+  );
+  const services = serviceList.data ?? [];
+  const service = services.find((item) => item.id === serviceId) ?? services[0];
   const query = service
     ? new URLSearchParams({
         group: service.group,
         name: service.name,
       }).toString()
     : "";
+  const deploymentList = useCachedApi<AiDeployment[]>(
+    base && query ? `${base}/deployments?${query}` : null,
+    aiCacheTtl.deployments,
+  );
+  const catalog = useCachedApi<AiModel[]>(
+    base && query && deployOpen ? `${base}/models?${query}` : null,
+    aiCacheTtl.models,
+  );
+  const quota = useCachedApi<AiUsage[]>(
+    base && query && deployOpen ? `${base}/usages?${query}` : null,
+    aiCacheTtl.usages,
+  );
+  const deployments = deploymentList.data ?? [];
+  const availableModels = useMemo(
+    () =>
+      (catalog.data ?? []).filter((model) => model.lifecycle !== "Deprecated"),
+    [catalog.data],
+  );
+  const loadingServices = serviceList.loading;
+  const loadingDeployments = deploymentList.loading;
+  const loadingModels = catalog.loading && !catalog.data;
+  const loadingUsage = quota.loading;
+  const modelError = catalog.error;
+  const usageError = quota.error;
+  const pageError = error || serviceList.error || deploymentList.error;
+  const selectedSku = model?.skus.find((item) => item.name === sku);
+  const usedQuota = selectedSku?.usageName
+    ? quota.data?.find(
+        (item) =>
+          item.name.toLowerCase() === selectedSku.usageName!.toLowerCase(),
+      )
+    : undefined;
   const operation = useInlineTask((task, job) => {
+    const base = `/accounts/${job.accountId}/ai`;
+    if (job.context === "service") invalidateApiCache(`${base}/services`);
+    else {
+      invalidateApiCache(`${base}/deployments?${job.context}`);
+      invalidateApiCache(`${base}/usages?${job.context}`);
+    }
     if (job.accountId !== accountId) return;
-    if (job.context === "service") setRefresh((value) => value + 1);
-    else if (job.context === query) setDeploymentRefresh((value) => value + 1);
+    if (job.context === "service") void serviceList.reload(true);
+    else if (job.context === query) void deploymentList.reload(true);
     if (task.status === "succeeded") notify(`${job.kind}已完成`);
   });
   useEffect(() => {
@@ -105,110 +131,12 @@ export default function AiPage({ session, notify }: Props) {
       active = false;
     };
   }, []);
+  // A revalidated service list can remove the selected resource. Never reuse
+  // a model selection from a different service.
   useEffect(() => {
-    let active = true;
-    setError("");
-    if (!accountId) {
-      setLoadingServices(false);
-      return;
-    }
-    setLoadingServices(true);
-    api<AiService[]>(
-      `/accounts/${accountId}/ai/services${refresh ? "?refresh=true" : ""}`,
-    )
-      .then((items) => {
-        if (active) {
-          setServices(items);
-          setServiceId((previous) =>
-            items.some((item) => item.id === previous)
-              ? previous
-              : (items[0]?.id ?? ""),
-          );
-        }
-      })
-      .catch((error) => {
-        if (active) setError(error.message);
-      })
-      .finally(() => {
-        if (active) setLoadingServices(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [accountId, refresh]);
-  useEffect(() => {
-    let active = true;
-    setError("");
-    if (!query) {
-      setLoadingDeployments(false);
-      return;
-    }
-    setLoadingDeployments(true);
-    api<AiDeployment[]>(
-      `/accounts/${accountId}/ai/deployments?${query}${deploymentRefresh ? "&refresh=true" : ""}`,
-    )
-      .then((items) => {
-        if (active) setDeployments(items);
-      })
-      .catch((error) => {
-        if (active) setError(error.message);
-      })
-      .finally(() => {
-        if (active) setLoadingDeployments(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [accountId, query, deploymentRefresh]);
-  // Catalogs and quota are independent of the deployment list, and load only
-  // when the user opens the deployment form. A slow quota request cannot block it.
-  useEffect(() => {
-    let active = true;
-    setModels([]);
     setModel(null);
-    setModelError("");
-    if (!query || !deployOpen) {
-      setLoadingModels(false);
-      return;
-    }
-    setLoadingModels(true);
-    api<AiModel[]>(`/accounts/${accountId}/ai/models?${query}`)
-      .then((items) => {
-        if (active) setModels(items);
-      })
-      .catch((error) => {
-        if (active) setModelError(error.message);
-      })
-      .finally(() => {
-        if (active) setLoadingModels(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [accountId, query, deployOpen, modelReload]);
-  useEffect(() => {
-    let active = true;
-    setUsage([]);
-    setUsageError("");
-    if (!query || !deployOpen) {
-      setLoadingUsage(false);
-      return;
-    }
-    setLoadingUsage(true);
-    api<AiUsage[]>(`/accounts/${accountId}/ai/usages?${query}`)
-      .then((items) => {
-        if (active) setUsage(items);
-      })
-      .catch((error) => {
-        if (active) setUsageError(error.message);
-      })
-      .finally(() => {
-        if (active) setLoadingUsage(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [accountId, query, deployOpen]);
+    setSku("");
+  }, [accountId, query]);
   const resetDialog = () => {
     setName("");
     setConfirmation("");
@@ -300,9 +228,7 @@ export default function AiPage({ session, notify }: Props) {
         <div>
           <div className="eyebrow">AZURE AI / MODEL DEPLOYMENTS</div>
           <h1>AI 模型管理</h1>
-          <p>
-            从 Azure 实时读取模型与容量，管理 OpenAI / AI Services 模型部署。
-          </p>
+          <p>按需读取 Azure 模型与容量，复用缓存加速访问，支持手动刷新。</p>
         </div>
         <Button
           variant="contained"
@@ -330,9 +256,9 @@ export default function AiPage({ session, notify }: Props) {
           当前为只读模式，可查看模型及部署；创建或删除需启用云端写操作。
         </Alert>
       )}
-      {error && (
+      {pageError && (
         <Alert severity="error" sx={{ mb: 2 }}>
-          {error}
+          {pageError}
         </Alert>
       )}
       <Paper className="query-panel">
@@ -343,11 +269,8 @@ export default function AiPage({ session, notify }: Props) {
           disabled={saving}
           onChange={(event) => {
             setAccountId(event.target.value);
-            setServices([]);
             setServiceId("");
-            setDeployments([]);
-            setRefresh(0);
-            setDeploymentRefresh(0);
+            setError("");
           }}
         >
           <MenuItem value="">请选择账户</MenuItem>
@@ -360,11 +283,10 @@ export default function AiPage({ session, notify }: Props) {
         <TextField
           label="AI 服务资源"
           select
-          value={serviceId}
-          disabled={loadingServices || saving || !services.length}
+          value={service?.id ?? ""}
+          disabled={saving || !services.length}
           onChange={(event) => {
             setServiceId(event.target.value);
-            setDeployments([]);
           }}
         >
           <MenuItem value="">请选择 AI 服务</MenuItem>
@@ -378,8 +300,8 @@ export default function AiPage({ session, notify }: Props) {
           aria-label="刷新 AI 服务"
           disabled={!accountId || loadingServices || loadingDeployments}
           onClick={() => {
-            setRefresh((value) => value + 1);
-            setDeploymentRefresh((value) => value + 1);
+            void serviceList.reload(true);
+            void deploymentList.reload(true);
           }}
         >
           <RefreshCw size={17} />
@@ -398,7 +320,11 @@ export default function AiPage({ session, notify }: Props) {
       </Paper>
       {loadingServices && (
         <>
-          <p className="muted">正在读取 AI 服务列表…</p>
+          <p className="muted">
+            {serviceList.data
+              ? "正在后台更新 AI 服务列表…"
+              : "正在读取 AI 服务列表…"}
+          </p>
           <LinearProgress />
         </>
       )}
@@ -488,7 +414,7 @@ export default function AiPage({ session, notify }: Props) {
         {!deployments.length &&
           !loadingServices &&
           !loadingDeployments &&
-          !error && (
+          !pageError && (
             <div className="empty">
               <Bot size={28} />
               <h3>{service ? "还没有部署模型" : "选择或创建 AI 服务资源"}</h3>
@@ -520,21 +446,21 @@ export default function AiPage({ session, notify }: Props) {
               <Alert
                 severity="error"
                 action={
-                  <Button onClick={() => setModelReload((value) => value + 1)}>
+                  <Button onClick={() => void catalog.reload(true)}>
                     重试
                   </Button>
                 }
               >
-                {modelError}
+                {catalog.data
+                  ? `更新失败，正在显示缓存目录：${modelError}`
+                  : modelError}
               </Alert>
             )}
-            {!loadingModels && !modelError && !models.length && (
+            {!loadingModels && !modelError && !availableModels.length && (
               <Alert severity="info">当前 AI 服务没有返回可用模型。</Alert>
             )}
             <Autocomplete
-              options={models.filter(
-                (model) => model.lifecycle !== "Deprecated",
-              )}
+              options={availableModels}
               value={model}
               loading={loadingModels}
               disabled={loadingModels}
@@ -551,6 +477,23 @@ export default function AiPage({ session, notify }: Props) {
                 <TextField {...params} label="模型与版本" />
               )}
             />
+            <Stack direction="row" spacing={1} alignItems="center">
+              <span className="muted">
+                {catalog.loading && catalog.data
+                  ? "正在后台更新模型目录…"
+                  : "模型目录缓存 1 小时；提交时重新校验版本与容量。"}
+              </span>
+              <Button
+                size="small"
+                disabled={catalog.loading || saving}
+                onClick={() => {
+                  void catalog.reload(true);
+                  void quota.reload(true);
+                }}
+              >
+                刷新模型目录
+              </Button>
+            </Stack>
             <TextField
               label="部署名称"
               value={name}

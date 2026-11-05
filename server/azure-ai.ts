@@ -1,6 +1,8 @@
 import { Azure, AzureError } from "./azure.js";
 import { createHash } from "node:crypto";
-import { AppError } from "./store.js";
+import { AppError, type Store } from "./store.js";
+import { AiCache } from "./ai-cache.js";
+import { aiCacheTtl } from "../shared/ai-cache.js";
 import type { Account, Credentials } from "../shared/types.js";
 import type {
   AiCreateService,
@@ -14,7 +16,13 @@ import type {
 
 const version = "2024-10-01";
 export class AzureAi {
-  constructor(private azure: Azure) {}
+  private cache: AiCache;
+  constructor(
+    private azure: Azure,
+    store?: Store,
+  ) {
+    this.cache = new AiCache(store);
+  }
   private root(account: Account, service: AiServiceRef) {
     return `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(service.group)}/providers/Microsoft.CognitiveServices/accounts/${encodeURIComponent(service.name)}`;
   }
@@ -27,7 +35,7 @@ export class AzureAi {
     const identity = createHash("sha256")
       .update(JSON.stringify(credentials))
       .digest("hex");
-    return `ai:${account.id}:${identity}:${kind}${service ? ":" + this.root(account, service).toLowerCase() : ""}`;
+    return `ai:${account.id}:${account.subscriptionId}:${identity}:${version}:${kind}${service ? ":" + this.root(account, service).toLowerCase() : ""}`;
   }
   async services(
     credentials: Credentials,
@@ -35,32 +43,40 @@ export class AzureAi {
     fresh = false,
   ): Promise<AiService[]> {
     const key = this.key(credentials, account, "services");
-    if (fresh) this.azure.invalidateCache(key);
-    return this.azure.cached(key, 60000, async () => {
-      const values = await this.azure.list(
-        credentials,
-        `/subscriptions/${account.subscriptionId}/providers/Microsoft.CognitiveServices/accounts?api-version=${version}`,
-      );
-      return values
-        .filter((item) => ["OpenAI", "AIServices"].includes(item.kind))
-        .map((item) => {
-          const ref = { group: item.id.split("/")[4], name: item.name };
-          this.azure.primeCache(
-            this.key(credentials, account, "service", ref),
-            item,
-            60000,
+    return this.cache.read(
+      account.id,
+      key,
+      aiCacheTtl.services,
+      async () => {
+        const values = await this.azure.list(
+          credentials,
+          `/subscriptions/${account.subscriptionId}/providers/Microsoft.CognitiveServices/accounts?api-version=${version}`,
+        );
+        return values
+          .filter((item) => ["OpenAI", "AIServices"].includes(item.kind))
+          .map((item) => {
+            return {
+              id: item.id,
+              group: item.id.split("/")[4],
+              name: item.name,
+              kind: item.kind,
+              location: item.location,
+              state: item.properties?.provisioningState ?? "Unknown",
+              endpoint: item.properties?.endpoint ?? null,
+            };
+          });
+      },
+      fresh,
+      (services) => {
+        for (const service of services)
+          this.cache.prime(
+            account.id,
+            this.key(credentials, account, "service", service),
+            { kind: service.kind },
+            aiCacheTtl.service,
           );
-          return {
-            id: item.id,
-            group: item.id.split("/")[4],
-            name: item.name,
-            kind: item.kind,
-            location: item.location,
-            state: item.properties?.provisioningState ?? "Unknown",
-            endpoint: item.properties?.endpoint ?? null,
-          };
-        });
-    });
+      },
+    );
   }
   private async verifyService(
     credentials: Credentials,
@@ -69,17 +85,22 @@ export class AzureAi {
     fresh = false,
   ) {
     const key = this.key(credentials, account, "service", service);
-    if (fresh) this.azure.invalidateCache(key);
-    return this.azure.cached(key, 60000, async () => {
-      const { data } = await this.azure.request(
-        credentials,
-        "GET",
-        `${this.root(account, service)}?api-version=${version}`,
-      );
-      if (!["OpenAI", "AIServices"].includes(data.kind))
-        throw new AppError(422, "请选择 Azure OpenAI 或 AI Services 资源");
-      return data;
-    });
+    return this.cache.read(
+      account.id,
+      key,
+      aiCacheTtl.service,
+      async () => {
+        const { data } = await this.azure.request(
+          credentials,
+          "GET",
+          `${this.root(account, service)}?api-version=${version}`,
+        );
+        if (!["OpenAI", "AIServices"].includes(data.kind))
+          throw new AppError(422, "请选择 Azure OpenAI 或 AI Services 资源");
+        return { kind: data.kind };
+      },
+      fresh,
+    );
   }
   async models(
     credentials: Credentials,
@@ -88,42 +109,47 @@ export class AzureAi {
     fresh = false,
   ): Promise<AiModel[]> {
     const key = this.key(credentials, account, "models", service);
-    if (fresh) this.azure.invalidateCache(key);
-    return this.azure.cached(key, 3600000, async () => {
-      await this.verifyService(credentials, account, service);
-      const models = await this.azure.list(
-        credentials,
-        `${this.root(account, service)}/models?api-version=${version}`,
-      );
-      return models
-        .filter((item) => item.name && item.format && item.version)
-        .map((item) => ({
-          name: item.name,
-          format: item.format,
-          version: item.version,
-          publisher: item.publisher ?? "",
-          lifecycle: item.lifecycleStatus ?? "Unknown",
-          capabilities: item.capabilities ?? {},
-          skus: (item.skus ?? [])
-            .filter((sku: { name?: string }) => sku.name)
-            .map((sku: any) => ({
-              name: sku.name,
-              usageName: sku.usageName ?? null,
-              minimum: sku.capacity?.minimum ?? 1,
-              maximum: sku.capacity?.maximum ?? item.maxCapacity ?? null,
-              step: sku.capacity?.step ?? 1,
-              default: sku.capacity?.default ?? sku.capacity?.minimum ?? 1,
-              azureDefault: sku.capacity?.default ?? null,
-              defaultSource:
-                sku.capacity?.default != null
-                  ? "azure"
-                  : sku.capacity?.minimum != null
-                    ? "minimum"
-                    : "fallback",
-              allowedValues: sku.capacity?.allowedValues ?? [],
-            })),
-        }));
-    });
+    return this.cache.read(
+      account.id,
+      key,
+      aiCacheTtl.models,
+      async () => {
+        await this.verifyService(credentials, account, service);
+        const models = await this.azure.list(
+          credentials,
+          `${this.root(account, service)}/models?api-version=${version}`,
+        );
+        return models
+          .filter((item) => item.name && item.format && item.version)
+          .map((item) => ({
+            name: item.name,
+            format: item.format,
+            version: item.version,
+            publisher: item.publisher ?? "",
+            lifecycle: item.lifecycleStatus ?? "Unknown",
+            capabilities: item.capabilities ?? {},
+            skus: (item.skus ?? [])
+              .filter((sku: { name?: string }) => sku.name)
+              .map((sku: any) => ({
+                name: sku.name,
+                usageName: sku.usageName ?? null,
+                minimum: sku.capacity?.minimum ?? 1,
+                maximum: sku.capacity?.maximum ?? item.maxCapacity ?? null,
+                step: sku.capacity?.step ?? 1,
+                default: sku.capacity?.default ?? sku.capacity?.minimum ?? 1,
+                azureDefault: sku.capacity?.default ?? null,
+                defaultSource:
+                  sku.capacity?.default != null
+                    ? "azure"
+                    : sku.capacity?.minimum != null
+                      ? "minimum"
+                      : "fallback",
+                allowedValues: sku.capacity?.allowedValues ?? [],
+              })),
+          }));
+      },
+      fresh,
+    );
   }
   async deployments(
     credentials: Credentials,
@@ -132,35 +158,42 @@ export class AzureAi {
     fresh = false,
   ): Promise<AiDeployment[]> {
     const key = this.key(credentials, account, "deployments", service);
-    if (fresh) this.azure.invalidateCache(key);
-    return this.azure.cached(key, 15000, async () => {
-      await this.verifyService(credentials, account, service);
-      return (
-        await this.azure.list(
-          credentials,
-          `${this.root(account, service)}/deployments?api-version=${version}`,
-        )
-      ).map((item) => ({
-        name: item.name,
-        model: {
-          format: item.properties?.model?.format ?? "",
-          name: item.properties?.model?.name ?? "",
-          version: item.properties?.model?.version ?? "",
-        },
-        sku: item.sku?.name ?? "",
-        capacity: item.sku?.capacity ?? 0,
-        state: item.properties?.provisioningState ?? "Unknown",
-      }));
-    });
+    return this.cache.read(
+      account.id,
+      key,
+      aiCacheTtl.deployments,
+      async () => {
+        await this.verifyService(credentials, account, service);
+        return (
+          await this.azure.list(
+            credentials,
+            `${this.root(account, service)}/deployments?api-version=${version}`,
+          )
+        ).map((item) => ({
+          name: item.name,
+          model: {
+            format: item.properties?.model?.format ?? "",
+            name: item.properties?.model?.name ?? "",
+            version: item.properties?.model?.version ?? "",
+          },
+          sku: item.sku?.name ?? "",
+          capacity: item.sku?.capacity ?? 0,
+          state: item.properties?.provisioningState ?? "Unknown",
+        }));
+      },
+      fresh,
+    );
   }
   async usages(
     credentials: Credentials,
     account: Account,
     service: AiServiceRef,
+    fresh = false,
   ): Promise<AiUsage[]> {
-    return this.azure.cached(
+    return this.cache.read(
+      account.id,
       this.key(credentials, account, "usages", service),
-      60000,
+      aiCacheTtl.usages,
       async () => {
         await this.verifyService(credentials, account, service);
         return (
@@ -176,6 +209,7 @@ export class AzureAi {
           unit: item.unit ?? "",
         }));
       },
+      fresh,
     );
   }
   async createService(
@@ -232,10 +266,8 @@ export class AzureAi {
         progress,
       );
     } finally {
-      this.azure.invalidateCache(this.key(credentials, account, "services"));
-      this.azure.invalidateCache(
-        this.key(credentials, account, "service", input),
-      );
+      this.cache.invalidate(this.key(credentials, account, "services"));
+      this.cache.invalidate(this.key(credentials, account, "service", input));
     }
   }
   async deploy(
@@ -291,12 +323,10 @@ export class AzureAi {
         progress,
       );
     } finally {
-      this.azure.invalidateCache(
+      this.cache.invalidate(
         this.key(credentials, account, "deployments", input),
       );
-      this.azure.invalidateCache(
-        this.key(credentials, account, "usages", input),
-      );
+      this.cache.invalidate(this.key(credentials, account, "usages", input));
     }
   }
   async deleteDeployment(
@@ -317,12 +347,10 @@ export class AzureAi {
         progress,
       );
     } finally {
-      this.azure.invalidateCache(
+      this.cache.invalidate(
         this.key(credentials, account, "deployments", service),
       );
-      this.azure.invalidateCache(
-        this.key(credentials, account, "usages", service),
-      );
+      this.cache.invalidate(this.key(credentials, account, "usages", service));
     }
   }
 }
