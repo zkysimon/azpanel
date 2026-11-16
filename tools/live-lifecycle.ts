@@ -219,7 +219,7 @@ try {
   );
   baselineMachines = await azure.list(
     credentials,
-    `/subscriptions/${account.subscriptionId}/providers/Microsoft.Compute/virtualMachines?api-version=2024-11-01`,
+    `/subscriptions/${account.subscriptionId}/providers/Microsoft.Compute/virtualMachines?api-version=2024-07-01`,
   );
   log("BASELINE", {
     subscription: account.subscriptionName,
@@ -384,7 +384,7 @@ try {
         .sort();
       const machinesAfter = await azure.list(
         credentials,
-        `/subscriptions/${account.subscriptionId}/providers/Microsoft.Compute/virtualMachines?api-version=2024-11-01`,
+        `/subscriptions/${account.subscriptionId}/providers/Microsoft.Compute/virtualMachines?api-version=2024-07-01`,
       );
       const resourcesAfter = await azure.list(
         credentials,
@@ -417,7 +417,7 @@ try {
         const { data: view } = await azure.request(
           credentials,
           "GET",
-          `${original.id}/instanceView?api-version=2024-11-01`,
+          `${original.id}/instanceView?api-version=2024-07-01`,
         );
         log("EXISTING_VM_AFTER", {
           name: original.name,

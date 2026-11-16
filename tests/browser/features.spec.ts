@@ -34,21 +34,48 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   await page.getByLabel("选择账户").click();
   await page.getByRole("option", { name: "开发工作空间" }).click();
   await page.getByRole("button", { name: "查询", exact: true }).click();
+  // Inspecting or cancelling an occupied group must never issue a DELETE.
+  const groupWrites: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "DELETE" && request.url().includes("/groups")) groupWrites.push(request.url());
+  });
+  await page.getByRole("row").filter({ hasText: "occupied" }).getByRole("button", { name: "删除资源组", exact: true }).click();
+  let groupDialog = page.getByRole("dialog");
+  await expect(groupDialog.getByText("protected-disk", { exact: true })).toBeVisible();
+  await expect(groupDialog.getByText("Microsoft.Compute/disks", { exact: true })).toBeVisible();
+  await groupDialog.getByLabel("输入「occupied」确认").fill("occupied");
+  await expect(groupDialog.getByRole("button", { name: "确认执行" })).toBeDisabled();
+  await groupDialog.getByRole("button", { name: "取消", exact: true }).click();
+  expect(groupWrites).toEqual([]);
+  await page.route("**/groups/delete-preview", async (route) => {
+    await route.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "资源清单读取失败" }) });
+  });
+  await page.getByRole("row").filter({ hasText: "occupied" }).getByRole("button", { name: "删除资源组", exact: true }).click();
+  groupDialog = page.getByRole("dialog");
+  await expect(groupDialog.getByText("资源清单读取失败", { exact: true })).toBeVisible();
+  await expect(groupDialog.getByRole("button", { name: "确认执行" })).toBeDisabled();
+  await groupDialog.getByRole("button", { name: "取消", exact: true }).click();
+  await page.unroute("**/groups/delete-preview");
+  expect(groupWrites).toEqual([]);
   await page.getByRole("checkbox", { name: "全选资源组" }).check();
   await page.getByRole("button", { name: "删除所选资源组" }).click();
+  groupDialog = page.getByRole("dialog");
+  await expect(groupDialog.getByText("protected-disk", { exact: true })).toBeVisible();
   await page
     .getByRole("dialog")
     .getByLabel("输入「DELETE」确认")
     .fill("DELETE");
+  await expect(groupDialog.getByRole("button", { name: "确认执行" })).toBeDisabled();
+  await groupDialog.getByRole("checkbox", { name: "我已核对上述资源，确认永久删除组内全部资源及数据" }).check();
   await page.getByRole("button", { name: "确认执行" }).click();
-  await expect(page.getByText(/occupied：资源组 occupied 非空/)).toBeVisible();
+  await expect(page.getByRole("region", { name: "当前操作进度" })).toContainText("已完成");
   await page.locator("nav").getByRole("button", { name: "任务中心" }).click();
   await expect(
     page.locator(".task-result").filter({ hasText: "empty" }),
   ).toContainText("删除成功");
   await expect(
     page.locator(".task-result").filter({ hasText: "occupied" }),
-  ).toContainText("protected-disk");
+  ).toContainText("删除成功");
 
   await page.locator("nav").getByRole("button", { name: "AI 模型" }).click();
   const aiReads: string[] = [];
@@ -239,6 +266,21 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   expect(destination.get("name")).toBe("browser-vm");
   expect(destination.get("group")).toBe("browser-vm-azpanel");
   await detail.getByRole("button", { name: "关闭详情" }).click();
+
+  const vmRow = page.getByRole("row").filter({ has: page.getByRole("button", { name: "browser-vm", exact: true }) });
+  await vmRow.getByLabel("管理").click();
+  await page.getByRole("option", { name: "删除虚拟机", exact: true }).click();
+  const deleteVm = page.getByRole("dialog");
+  const force = deleteVm.getByRole("checkbox", { name: /强制删除/ });
+  await expect(force).not.toBeChecked();
+  await force.check();
+  await expect(deleteVm.getByText(/强制删除将跳过正常关机/)).toBeVisible();
+  await deleteVm.getByLabel("输入「browser-vm」确认").fill("browser-vm");
+  const deletionRequest = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/action"));
+  await deleteVm.getByRole("button", { name: "确认执行" }).click();
+  expect((await deletionRequest).postDataJSON()).toMatchObject({ action: "delete", force: true });
+  await expect(page.getByRole("region", { name: "当前操作进度" })).toContainText("已完成");
+  await expect(page.getByRole("button", { name: "browser-vm", exact: true })).toHaveCount(0);
 
   // A failed creation remains in the wizard with its entered values.
   await page.getByRole("button", { name: "创建虚拟机", exact: true }).click();

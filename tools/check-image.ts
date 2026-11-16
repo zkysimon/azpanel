@@ -42,7 +42,7 @@ if (process.argv.includes("--reproduce-old-url")) {
     await azure.request(
       credentials,
       "GET",
-      `${root}/server?api-version=2024-11-01`,
+      `${root}/server?api-version=2024-07-01`,
     );
     console.log("Old SKU URL unexpectedly accepted");
   } catch (error) {
@@ -52,7 +52,7 @@ if (process.argv.includes("--reproduce-old-url")) {
 const { data: skus } = await azure.request(
   credentials,
   "GET",
-  `${root}?api-version=2024-11-01`,
+  `${root}?api-version=2024-07-01`,
 );
 console.log("Image SKUs response is a bare array:", Array.isArray(skus));
 const resolved = await azure.assertImageAvailable(

@@ -50,6 +50,11 @@ const confirmationSchema = z.object({ confirmation: z.string() });
 const refreshSchema = z.object({
   refresh: z.enum(["true", "false"]).optional(),
 });
+const groupNameSchema = z.string().regex(/^[\w.()-]{1,90}$/);
+const groupDeletionSchema = z.object({
+  group: groupNameSchema,
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+});
 export async function buildApp(
   config: Config,
   supplied?: { store?: Store; azure?: Azure },
@@ -393,6 +398,11 @@ export async function buildApp(
     const { account, credentials } = accountContext(request);
     return azure.locations(credentials, account);
   });
+  app.get("/api/accounts/:id/vm-locations", async (request) => {
+    const { account, credentials } = accountContext(request);
+    const { refresh } = refreshSchema.parse(request.query);
+    return azure.vmLocations(credentials, account, refresh === "true");
+  });
   app.get("/api/accounts/:id/billing", async (request) => {
     const { account, credentials } = accountContext(request);
     const cached = store.db
@@ -534,17 +544,31 @@ export async function buildApp(
       .parse(request.query);
     return azure.groupResources(credentials, account, group);
   });
+  app.post("/api/accounts/:id/groups/delete-preview", async (request) => {
+    const { account, credentials } = accountContext(request);
+    const { groups } = z
+      .object({ groups: z.array(groupNameSchema).min(1).max(50) })
+      .parse(request.body);
+    const previews = [];
+    for (const group of groups)
+      previews.push(
+        await azure.previewGroupDeletion(credentials, account, group),
+      );
+    return previews;
+  });
   app.delete("/api/accounts/:id/groups", async (request) => {
     checkWrites();
     const { account, credentials } = accountContext(request);
-    const input = z
-      .object({
-        group: z.string().regex(/^[\w.()-]{1,90}$/),
-        confirmation: z.string(),
-      })
+    const input = groupDeletionSchema
+      .extend({ confirmation: z.string() })
       .parse(request.body);
     confirm(input.confirmation, input.group);
-    await azure.assertGroupEmpty(credentials, account, input.group);
+    await azure.assertGroupDeletionUnchanged(
+      credentials,
+      account,
+      input.group,
+      input.fingerprint,
+    );
     return {
       taskId: tasks.enqueue(
         user(request).id,
@@ -552,12 +576,14 @@ export async function buildApp(
         "删除资源组",
         input.group,
         async (progress) => {
-          await azure.deleteEmptyGroup(
+          await azure.deleteGroup(
             credentials,
             account,
             input.group,
+            input.fingerprint,
             progress,
           );
+          store.removeGroupMachines(account.id, input.group);
         },
       ),
     };
@@ -568,12 +594,12 @@ export async function buildApp(
     const { groups, confirmation } = z
       .object({
         groups: z
-          .array(z.string().regex(/^[\w.()-]{1,90}$/))
+          .array(groupDeletionSchema)
           .min(1)
           .max(50)
           .refine(
             (items) =>
-              new Set(items.map((item) => item.toLowerCase())).size ===
+              new Set(items.map((item) => item.group.toLowerCase())).size ===
               items.length,
             "资源组不能重复",
           ),
@@ -593,9 +619,14 @@ export async function buildApp(
       throw new AppError(409, "该账户已有任务正在执行，请等待完成");
     }
     const results: TaskItemResult[] = [];
-    for (const group of groups) {
+    for (const { group, fingerprint } of groups) {
       try {
-        await azure.assertGroupEmpty(credentials, account, group);
+        await azure.assertGroupDeletionUnchanged(
+          credentials,
+          account,
+          group,
+          fingerprint,
+        );
         results.push({ name: group, status: "queued" });
       } catch (error) {
         results.push({
@@ -613,7 +644,7 @@ export async function buildApp(
     const taskId = tasks.enqueue(
       user(request).id,
       account.id,
-      "批量删除空资源组",
+      "批量删除资源组及组内资源",
       `${eligible.length} 个资源组`,
       async (progress) => {
         const completed: TaskItemResult[] = results.filter(
@@ -622,12 +653,14 @@ export async function buildApp(
         for (const item of eligible) {
           progress(`正在删除 ${item.name}`);
           try {
-            await azure.deleteEmptyGroup(
+            await azure.deleteGroup(
               credentials,
               account,
               item.name,
+              groups.find((group) => group.group === item.name)!.fingerprint,
               progress,
             );
+            store.removeGroupMachines(account.id, item.name);
             completed.push({ name: item.name, status: "succeeded" });
           } catch (error) {
             completed.push({
@@ -668,7 +701,18 @@ export async function buildApp(
         "创建虚拟机",
         input.name,
         async (progress) => {
-          await azure.create(credentials, account, input, progress);
+          try {
+            await azure.create(credentials, account, input, progress);
+          } catch (error) {
+            // Make partially created VMs visible for cleanup, preserving the
+            // original deployment failure even if this follow-up read also fails.
+            try {
+              await sync(user(request).id, account, credentials, progress);
+            } catch {
+              // The original deployment error is more useful than a sync error.
+            }
+            throw error;
+          }
           await sync(user(request).id, account, credentials, progress);
         },
       ),
@@ -694,9 +738,12 @@ export async function buildApp(
         confirmation: z.string(),
         size: sizeSchema.optional(),
         diskSize: z.number().int().min(30).max(4095).optional(),
+        force: z.boolean().default(false),
       })
       .parse(request.body);
     confirm(input.confirmation, vm.name);
+    if (input.force && input.action !== "delete")
+      throw new AppError(422, "强制选项仅适用于删除虚拟机");
     if (input.action === "resize" && !input.size)
       throw new AppError(422, "请选择新规格");
     if (input.action === "disk" && !input.diskSize)
@@ -707,12 +754,25 @@ export async function buildApp(
       taskId: tasks.enqueue(
         user(request).id,
         account.id,
-        input.action,
+        input.force ? "强制删除虚拟机" : input.action,
         vm.name,
         async (progress) => {
-          if (input.action === "delete")
-            await azure.deleteVm(credentials, vm, progress);
-          else if (input.action === "resize")
+          if (input.action === "delete") {
+            await azure.deleteVm(credentials, vm, progress, input.force);
+            store.removeMachine(account.id, vm.id);
+            try {
+              await sync(user(request).id, account, credentials, progress);
+            } catch {
+              return {
+                message:
+                  "虚拟机已删除，本地记录已清理；其余资源同步失败，请在账户页重新同步",
+              };
+            }
+            // A successful delete is authoritative even if the subsequent list
+            // briefly contains the old VM due to ARM eventual consistency.
+            store.removeMachine(account.id, vm.id);
+            return;
+          } else if (input.action === "resize")
             await azure.resize(credentials, vm, input.size!, progress);
           else if (input.action === "disk")
             await azure.resizeDisk(credentials, vm, input.diskSize!, progress);

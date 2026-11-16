@@ -9,6 +9,7 @@ export default function RegionSelect({
   loading = false,
   error = "",
   disabled = false,
+  helperText,
 }: {
   regions: Location[];
   value: string;
@@ -16,6 +17,7 @@ export default function RegionSelect({
   loading?: boolean;
   error?: string;
   disabled?: boolean;
+  helperText?: string;
 }) {
   const options = sortRegions(regions);
   const valid = options.some((region) => region.name === value);
@@ -32,7 +34,7 @@ export default function RegionSelect({
         (loading
           ? "正在读取实体区域…"
           : options.length
-            ? "按大洲分组；具体规格和配额以当前订阅为准"
+            ? (helperText ?? "按大洲分组；具体规格和配额以当前订阅为准")
             : "没有可用的实体区域，请重新加载")
       }
     >

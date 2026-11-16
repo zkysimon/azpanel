@@ -265,6 +265,18 @@ export class Store {
     if (!row) throw new AppError(404, "虚拟机不存在，请同步账户");
     return { vm: JSON.parse(row.data), raw: JSON.parse(row.raw) };
   }
+  removeMachine(accountId: string, id: string) {
+    this.db
+      .prepare("DELETE FROM machines WHERE account_id=? AND id=?")
+      .run(accountId, id);
+  }
+  removeGroupMachines(accountId: string, group: string) {
+    this.db
+      .prepare(
+        "DELETE FROM machines WHERE account_id=? AND lower(json_extract(data,'$.resourceGroup'))=lower(?)",
+      )
+      .run(accountId, group);
+  }
   replaceMachines(
     accountId: string,
     machines: { vm: VirtualMachine; raw: Json }[],
@@ -298,10 +310,13 @@ export class Store {
   task(userId: string, id: string): Task | null {
     const row = this.db
       .prepare(
-        "SELECT id,account_id AS accountId,kind,target,status,progress,error,created_at AS createdAt,updated_at AS updatedAt FROM tasks WHERE id=? AND user_id=?",
+        "SELECT id,account_id AS accountId,kind,target,status,progress,error,created_at AS createdAt,updated_at AS updatedAt,(SELECT data FROM task_results WHERE task_id=tasks.id) AS results FROM tasks WHERE id=? AND user_id=?",
       )
-      .get(id, userId);
-    return (row as unknown as Task) ?? null;
+      .get(id, userId) as unknown as
+      (Omit<Task, "results"> & { results: string | null }) | undefined;
+    return row
+      ? { ...row, results: row.results ? JSON.parse(row.results) : undefined }
+      : null;
   }
   audit(userId: string, action: string, target: string) {
     this.db

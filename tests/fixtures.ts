@@ -55,3 +55,13 @@ export const machine: VirtualMachine = {
   syncedAt: Date.now(),
   resourceId: `/subscriptions/${account.subscriptionId}/resourceGroups/dev-api-01-azpanel/providers/Microsoft.Compute/virtualMachines/dev-api-01`,
 };
+export function providerMetadata(namespace: string, locations = ["eastus", "eastasia", "japaneast", "francecentral", "australiaeast"]) {
+  return {
+    namespace,
+    registrationState: "Registered",
+    resourceTypes: (namespace === "Microsoft.Compute"
+      ? ["virtualMachines", "disks"]
+      : ["networkSecurityGroups", "publicIPAddresses", "virtualNetworks", "networkInterfaces"]
+    ).map((resourceType) => ({ resourceType, locations })),
+  };
+}

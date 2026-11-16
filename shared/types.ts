@@ -61,6 +61,11 @@ export interface BatchDeleteResponse {
   taskId: string | null;
   results: TaskItemResult[];
 }
+export interface GroupDeletionPreview {
+  group: string;
+  fingerprint: string;
+  resources: { id: string; name: string; type: string }[];
+}
 export interface User {
   id: string;
   email: string;

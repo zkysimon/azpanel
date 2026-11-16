@@ -22,6 +22,7 @@ import {
   DialogTitle,
   Divider,
   Drawer,
+  FormControlLabel,
   IconButton,
   InputAdornment,
   LinearProgress,
@@ -82,7 +83,6 @@ import {
 } from "lucide-react";
 import type {
   Account,
-  BatchDeleteResponse,
   TaskItemResult,
   Audit,
   Invite,
@@ -109,6 +109,7 @@ import { makeTheme } from "./theme.js";
 import "./styles.css";
 import BillingCard from "./BillingCard.js";
 import RegionSelect from "./RegionSelect.js";
+import GroupDeleteDialog from "./GroupDeleteDialog.js";
 import InlineTask from "./InlineTask.js";
 import { useInlineTask } from "./useInlineTask.js";
 const MetricsChart = lazy(() => import("./MetricsChart.js"));
@@ -989,7 +990,12 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
     [confirmation, setConfirmation] = useState(""),
     [size, setSize] = useState(""),
     [disk, setDisk] = useState(64),
+    [forceDelete, setForceDelete] = useState(false),
     [details, setDetails] = useState<VirtualMachine | null>(null);
+  const operation = useInlineTask((task) => {
+    reload();
+    if (task.status === "succeeded") notify(task.progress);
+  });
   const requestedMachine = useMemo(() => {
     const params = new URLSearchParams(location.hash.split("?")[1] ?? "");
     return {
@@ -1074,6 +1080,11 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
           <RefreshCw size={18} />
         </IconButton>
       </div>
+      <InlineTask
+        job={operation.job}
+        task={operation.task}
+        error={operation.error}
+      />
       {loading && <LinearProgress />}
       <TableContainer component={Paper} className="data-table">
         <Table>
@@ -1110,6 +1121,11 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
                   </TableCell>
                   <TableCell>
                     <Status value={vm.powerState} />
+                    {vm.provisioningState.toLowerCase() === "failed" && (
+                      <small className="table-sub">
+                        <Status value="failed" />
+                      </small>
+                    )}
                   </TableCell>
                   <TableCell>
                     {vm.size.replace("Standard_", "")}
@@ -1132,6 +1148,7 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
                         setSelected(vm);
                         setAction(e.target.value);
                         setConfirmation("");
+                        setForceDelete(false);
                         setSize(vm.size);
                         setDisk(vm.diskSize + 32);
                       }}
@@ -1140,7 +1157,7 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
                         <MenuItem
                           key={value}
                           value={value}
-                          disabled={!session.writesEnabled}
+                          disabled={!session.writesEnabled || operation.running}
                         >
                           {label}
                         </MenuItem>
@@ -1172,14 +1189,25 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
         value={confirmation}
         onChange={setConfirmation}
         onClose={() => setSelected(null)}
-        disabled={!session.writesEnabled}
+        disabled={!session.writesEnabled || operation.running}
         onConfirm={async () => {
           try {
-            await api(`/machines/${selected!.id}/action`, "POST", {
-              action,
-              confirmation,
-              ...(action === "resize" ? { size } : {}),
-              ...(action === "disk" ? { diskSize: disk } : {}),
+            const result = await api<{ taskId: string }>(
+              `/machines/${selected!.id}/action`,
+              "POST",
+              {
+                action,
+                confirmation,
+                ...(action === "delete" ? { force: forceDelete } : {}),
+                ...(action === "resize" ? { size } : {}),
+                ...(action === "disk" ? { diskSize: disk } : {}),
+              },
+            );
+            operation.start({
+              id: result.taskId,
+              accountId: selected!.accountId,
+              target: selected!.name,
+              kind: forceDelete ? "强制删除虚拟机" : actionNames[action],
             });
             setSelected(null);
             notify("操作已加入后台任务队列");
@@ -1188,6 +1216,25 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
           }
         }}
       >
+        {action === "delete" && (
+          <>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={forceDelete}
+                  onChange={(_, value) => setForceDelete(value)}
+                />
+              }
+              label="强制删除（适用于创建失败或普通删除失败的虚拟机）"
+            />
+            {forceDelete && (
+              <Alert severity="error">
+                强制删除将跳过正常关机及部分清理步骤。仅在不需要恢复磁盘数据时使用，不会绕过
+                Azure 权限或资源锁；不会自动删除整个资源组。
+              </Alert>
+            )}
+          </>
+        )}
         {action === "resize" && (
           <TextField
             label="新规格"
@@ -1450,7 +1497,9 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     setLoadingLocations(true);
     setLocationsError("");
     setLocations([]);
-    api<Location[]>(`/accounts/${accountId}/locations`)
+    api<Location[]>(
+      `/accounts/${accountId}/vm-locations${regionReload ? "?refresh=true" : ""}`,
+    )
       .then((list) => {
         if (!current) return;
         setLocations(list);
@@ -1658,16 +1707,14 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                     onChange={(value) => field("location", value)}
                     loading={loadingLocations}
                     error={locationsError}
+                    helperText="已筛选 VM、托管磁盘及网络支持区域；仍需满足订阅准入、规格和配额要求"
                   />
-                  {!loadingLocations &&
-                    (locationsError || !locations.length) && (
-                      <Button
-                        disabled={!accountId}
-                        onClick={() => setRegionReload((value) => value + 1)}
-                      >
-                        重新加载区域
-                      </Button>
-                    )}
+                  <Button
+                    disabled={!accountId || loadingLocations}
+                    onClick={() => setRegionReload((value) => value + 1)}
+                  >
+                    重新加载区域
+                  </Button>
                 </div>
                 <TextField
                   select
@@ -1990,18 +2037,32 @@ function ExplorePage({
     [busy, setBusy] = useState(false),
     [group, setGroup] = useState(""),
     [items, setItems] = useState<Json[] | null>(null),
-    [remove, setRemove] = useState(""),
+    [deletionGroups, setDeletionGroups] = useState<string[]>([]),
     [selectedGroups, setSelectedGroups] = useState<string[]>([]),
-    [batchOpen, setBatchOpen] = useState(false),
-    [deleteResults, setDeleteResults] = useState<TaskItemResult[]>([]),
-    [confirmation, setConfirmation] = useState("");
+    [deleteResults, setDeleteResults] = useState<TaskItemResult[]>([]);
+  const deletion = useInlineTask((task, job) => {
+    if (job.accountId !== account) return;
+    if (task.results) setDeleteResults(task.results);
+    else if (task.status === "succeeded")
+      setDeleteResults((results) =>
+        results.map((result) => ({ ...result, status: "succeeded" })),
+      );
+    else
+      setDeleteResults((results) =>
+        results.map((result) => ({
+          ...result,
+          status: "failed",
+          message: task.error ?? "删除未完成，请检查任务详情",
+        })),
+      );
+    void load();
+  });
   useEffect(() => {
     setData(null);
     setItems(null);
     setSelectedGroups([]);
     setDeleteResults([]);
-    setRemove("");
-    setBatchOpen(false);
+    setDeletionGroups([]);
   }, [account, region, mode]);
   // Region list comes from the selected account.
   useEffect(() => {
@@ -2108,24 +2169,43 @@ function ExplorePage({
           <Button
             color="error"
             startIcon={<Trash2 size={16} />}
-            disabled={!session.writesEnabled || !selectedGroups.length || busy}
+            disabled={
+              !session.writesEnabled ||
+              !selectedGroups.length ||
+              busy ||
+              deletion.running
+            }
             onClick={() => {
-              setConfirmation("");
-              setBatchOpen(true);
+              setDeletionGroups([...selectedGroups]);
             }}
           >
             删除所选资源组
           </Button>
-          <span className="muted">仅删除空资源组，非空项会立即显示原因。</span>
+          <span className="muted">
+            先核对资源清单，确认后删除资源组及组内全部资源。
+          </span>
         </div>
       )}
+      <InlineTask
+        job={deletion.job}
+        task={deletion.task}
+        error={deletion.error}
+      />
       {deleteResults.map((result) => (
         <Alert
           key={result.name}
-          severity={result.status === "failed" ? "warning" : "info"}
+          severity={
+            result.status === "failed"
+              ? "warning"
+              : result.status === "succeeded"
+                ? "success"
+                : "info"
+          }
           sx={{ mb: 1 }}
         >
-          {result.name}：{result.message ?? "已加入删除队列"}
+          {result.name}：
+          {result.message ??
+            (result.status === "succeeded" ? "删除成功" : "已加入删除队列")}
         </Alert>
       ))}
       <TableContainer component={Paper} className="data-table">
@@ -2225,10 +2305,9 @@ function ExplorePage({
                       </Button>
                       <IconButton
                         aria-label="删除资源组"
-                        disabled={!session.writesEnabled}
+                        disabled={!session.writesEnabled || deletion.running}
                         onClick={() => {
-                          setRemove(item.name);
-                          setConfirmation("");
+                          setDeletionGroups([item.name]);
                         }}
                       >
                         <Trash2 size={16} />
@@ -2284,55 +2363,31 @@ function ExplorePage({
           <Button onClick={() => setItems(null)}>关闭</Button>
         </DialogActions>
       </Dialog>
-      <ConfirmDialog
-        open={!!remove}
-        title="删除空资源组"
-        description="删除前会检查组内资源。存在虚拟机、磁盘、网络或其他资源时将立即拒绝，并说明原因。"
-        target={remove}
-        value={confirmation}
-        onChange={setConfirmation}
-        onClose={() => setRemove("")}
-        onConfirm={async () => {
-          try {
-            await api(`/accounts/${account}/groups`, "DELETE", {
-              group: remove,
-              confirmation,
-            });
-            setRemove("");
-            notify("资源组删除任务已提交");
-          } catch (e) {
-            notify((e as Error).message);
-          }
-        }}
-      />
-      <ConfirmDialog
-        open={batchOpen}
-        title="批量删除空资源组"
-        description={`将逐项检查所选 ${selectedGroups.length} 个资源组。非空组跳过并报告原因，空组加入后台删除任务。输入 DELETE 确认。`}
-        target="DELETE"
-        value={confirmation}
-        onChange={setConfirmation}
-        onClose={() => setBatchOpen(false)}
-        onConfirm={async () => {
-          try {
-            const result = await api<BatchDeleteResponse>(
-              `/accounts/${account}/groups/delete-batch`,
-              "POST",
-              { groups: selectedGroups, confirmation },
-            );
+      {!!deletionGroups.length && (
+        <GroupDeleteDialog
+          accountId={account}
+          groups={deletionGroups}
+          enabled={session.writesEnabled}
+          onClose={() => setDeletionGroups([])}
+          onSubmitted={(result) => {
             setDeleteResults(result.results);
-            setBatchOpen(false);
+            setDeletionGroups([]);
             setSelectedGroups([]);
+            if (result.taskId)
+              deletion.start({
+                id: result.taskId,
+                accountId: account,
+                target: deletionGroups.join("、"),
+                kind: "删除资源组及组内资源",
+              });
             notify(
               result.taskId
-                ? "空资源组已加入删除任务，详细结果见任务中心"
+                ? "资源组删除任务已提交，进度将在当前页面更新"
                 : "未执行删除，请查看逐项原因",
             );
-          } catch (error) {
-            notify((error as Error).message);
-          }
-        }}
-      />
+          }}
+        />
+      )}
     </>
   );
 }

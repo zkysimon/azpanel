@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type {
   Account,
   Credentials,
+  GroupDeletionPreview,
   Json,
   MetricPoint,
   Quota,
@@ -22,12 +23,66 @@ import { AppError } from "./store.js";
 import { regionGroup, sortRegions } from "../shared/regions.js";
 
 const ARM = "https://management.azure.com";
-const compute = "2024-11-01";
+const compute = "2024-07-01";
 const network = "2023-11-01";
 const resources = "2021-04-01";
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 type Transport = typeof fetch;
 type TokenProvider = (credentials: Credentials) => Promise<string>;
+const vmResourceTypes: Record<string, string[]> = {
+  "Microsoft.Compute": ["virtualMachines", "disks"],
+  "Microsoft.Network": [
+    "networkSecurityGroups",
+    "publicIPAddresses",
+    "virtualNetworks",
+    "networkInterfaces",
+  ],
+};
+const normalizeLocation = (value: string) =>
+  value.toLowerCase().replace(/[^a-z0-9]/g, "");
+function unsupportedVmResources(region: string, providers: Json[]) {
+  return Object.entries(vmResourceTypes).flatMap(([namespace, types], index) =>
+    types
+      .filter((type) => {
+        const entry = providers[index].resourceTypes?.find(
+          (entry: Json) =>
+            entry.resourceType?.toLowerCase() === type.toLowerCase(),
+        );
+        return !entry?.locations?.some(
+          (location: string) =>
+            normalizeLocation(location) === normalizeLocation(region),
+        );
+      })
+      .map((type) => `${namespace}/${type}`),
+  );
+}
+/** Codes only: Azure can echo passwords/customData in template error messages. */
+function azureFailure(error: Json, fallback = "OperationFailed") {
+  const codes: string[] = [];
+  function visit(value: Json, depth = 0) {
+    const code = String(value.code ?? "")
+      .replace(/[^a-zA-Z0-9_.-]/g, "")
+      .slice(0, 100);
+    if (code && !codes.includes(code)) codes.push(code);
+    if (depth < 4 && codes.length < 12)
+      for (const child of (value.details ?? []).slice(0, 12))
+        visit(child, depth + 1);
+  }
+  visit(error);
+  const hints: Record<string, string> = {
+    InvalidResourceLocation:
+      "目标区域不支持该资源，请更换区域或联系 Azure 支持确认订阅访问权限",
+    LocationNotAvailableForResourceType:
+      "目标区域不支持该资源，请更换区域或联系 Azure 支持确认订阅访问权限",
+    ScopeLocked: "资源或上级范围存在锁，请先在 Azure Portal 检查锁",
+    AuthorizationFailed: "权限不足，请检查服务主体 RBAC",
+    SkuNotAvailable: "所选规格在目标区域不可用，请更换规格或区域",
+    OperationNotAllowed:
+      "Azure 不允许此操作，请检查配额及活动日志；失败 VM 可尝试明确确认后的强制删除",
+  };
+  const hint = codes.map((code) => hints[code]).find(Boolean);
+  return `[${codes.join(" > ") || fallback}]${hint ? "：" + hint : ""}`;
+}
 export class AzureError extends AppError {
   constructor(
     readonly azureStatus: number,
@@ -217,7 +272,7 @@ export class Azure {
             : "";
         throw new AzureError(
           response.status,
-          `Azure [${code}] ${messages[response.status] ?? "请求失败"}${detail ? "：" + detail : ""}`,
+          `Azure ${azureFailure(data.error ?? {}, code)} ${messages[response.status] ?? "请求失败"}${detail ? "：" + detail : ""}`,
         );
       }
       return { data, headers: response.headers, status: response.status };
@@ -247,17 +302,31 @@ export class Azure {
     body?: unknown,
     progress?: (message: string) => void,
   ): Promise<Json> {
-    const initial = await this.request(credentials, method, path, body);
+    let initial;
+    try {
+      initial = await this.request(credentials, method, path, body);
+    } catch (error) {
+      // Only a 404 on the DELETE itself proves an already absent resource.
+      // A missing operation-status endpoint is not proof of deletion.
+      if (
+        method === "DELETE" &&
+        error instanceof AzureError &&
+        error.azureStatus === 404
+      )
+        return {};
+      throw error;
+    }
     const async = initial.headers.get("azure-asyncoperation");
     const location = initial.headers.get("location");
     const state = initial.data.properties?.provisioningState?.toLowerCase();
     if (
       initial.data.error ||
-      ["failed", "canceled", "cancelled"].includes(state ?? "")
+      (method !== "DELETE" &&
+        ["failed", "canceled", "cancelled"].includes(state ?? ""))
     ) {
       throw new AppError(
         502,
-        `Azure 部署失败 [${initial.data.error?.code ?? state}]`,
+        `Azure 部署失败 ${azureFailure(initial.data.error ?? {}, state)}`,
       );
     }
     if (
@@ -268,7 +337,10 @@ export class Azure {
     )
       return initial.data;
     const deadline = Date.now() + 10 * 60_000;
-    const pollPath = async ?? location ?? path;
+    const pollUrl = armUrl(async ?? location ?? path);
+    if (method === "DELETE" && !async && !location)
+      pollUrl.searchParams.delete("forceDeletion");
+    const pollPath = pollUrl.href;
     if (!async && !location && method === "POST")
       throw new AppError(
         502,
@@ -296,10 +368,13 @@ export class Azure {
         result.data.status ?? result.data.properties?.provisioningState ?? "",
       ).toLowerCase();
       pollHeaders = result.headers;
-      if (["failed", "canceled", "cancelled"].includes(status))
+      if (
+        ["failed", "canceled", "cancelled"].includes(status) &&
+        !(method === "DELETE" && !async && !location && !result.data.error)
+      )
         throw new AppError(
           502,
-          `Azure 部署${status} [${result.data.error?.code ?? "OperationFailed"}]`,
+          `Azure 操作${status} ${azureFailure(result.data.error ?? {})}`,
         );
       if (
         (!(method === "DELETE" && !async && !location) &&
@@ -383,6 +458,34 @@ export class Azure {
       );
     });
   }
+  /** Generic subscription locations do not imply VM/disk/network availability. */
+  async vmLocations(credentials: Credentials, account: Account, fresh = false) {
+    const key = `vm-locations:${account.id}`;
+    if (fresh) {
+      this.invalidateCache(key);
+      this.invalidateCache(`locations:${account.id}`);
+    }
+    return this.cached(key, 900000, async () => {
+      const locations = await this.locations(credentials, account);
+      const providers: Json[] = [];
+      for (const namespace of Object.keys(vmResourceTypes)) {
+        const { data } = await this.request(
+          credentials,
+          "GET",
+          `/subscriptions/${account.subscriptionId}/providers/${namespace}?api-version=${resources}`,
+        );
+        if (!Array.isArray(data.resourceTypes))
+          throw new AppError(
+            502,
+            "Azure 未返回资源类型区域信息，无法确认可部署区域",
+          );
+        providers.push(data);
+      }
+      return locations.filter(
+        (location) => !unsupportedVmResources(location.name, providers).length,
+      );
+    });
+  }
   /** Reads each curated offer's SKUs live from Azure. Cached 24h per account+region. */
   async imageOptions(
     credentials: Credentials,
@@ -397,7 +500,7 @@ export class Azure {
           // Compute image catalog APIs return a bare array, unlike ARM resource lists.
           const skus = await this.imageCatalogList(
             credentials,
-            `${base}/${target.publisher}/artifacttypes/vmimage/offers/${target.offer}/skus?api-version=2024-11-01`,
+            `${base}/${target.publisher}/artifacttypes/vmimage/offers/${target.offer}/skus?api-version=${compute}`,
           );
           for (const sku of selectGen2Skus(
             skus.map((item) => String(item.name)),
@@ -556,38 +659,67 @@ export class Azure {
       `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(group)}/resources?api-version=${resources}`,
     );
   }
-  /** Uncached first page: enough to refuse a non-empty group without enumerating it. */
-  async assertGroupEmpty(
+  async previewGroupDeletion(
     credentials: Credentials,
     account: Account,
     group: string,
+  ): Promise<GroupDeletionPreview> {
+    const items = await this.groupResources(credentials, account, group);
+    if (items.some((item) => !item.id || !item.name || !item.type))
+      throw new AppError(502, "资源清单不完整，已取消删除；请重新读取");
+    const entries = items
+      .map((item) => ({
+        id: String(item.id),
+        name: String(item.name),
+        type: String(item.type),
+      }))
+      .sort((a, b) => a.id.toLowerCase().localeCompare(b.id.toLowerCase()));
+    const fingerprint = createHash("sha256")
+      .update(
+        JSON.stringify([
+          account.subscriptionId.toLowerCase(),
+          group.toLowerCase(),
+          entries.map((item) => [
+            item.id.toLowerCase(),
+            item.name.toLowerCase(),
+            item.type.toLowerCase(),
+          ]),
+        ]),
+      )
+      .digest("hex");
+    return { group, fingerprint, resources: entries };
+  }
+  async assertGroupDeletionUnchanged(
+    credentials: Credentials,
+    account: Account,
+    group: string,
+    fingerprint: string,
   ) {
-    const { data } = await this.request(
+    const current = await this.previewGroupDeletion(
       credentials,
-      "GET",
-      `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(group)}/resources?api-version=${resources}&$top=5`,
+      account,
+      group,
     );
-    if (!Array.isArray(data.value))
-      throw new AppError(502, "无法确认资源组是否为空，已取消删除");
-    if (data.value.length || data.nextLink) {
-      const examples = data.value
-        .slice(0, 5)
-        .map((item: Json) => `${item.name}（${item.type}）`)
-        .join("、");
+    if (current.fingerprint !== fingerprint)
       throw new AppError(
         409,
-        `资源组 ${group} 非空，仍包含${examples || "其他资源"}${data.nextLink ? "等资源" : ""}。请先删除或迁移组内资源。`,
+        `资源组 ${group} 的资源列表已变化，请重新查看清单并确认删除`,
       );
-    }
   }
-  async deleteEmptyGroup(
+  async deleteGroup(
     credentials: Credentials,
     account: Account,
     group: string,
+    fingerprint: string,
     progress?: (message: string) => void,
   ) {
-    // Check again when the queued task starts; never rely on a cached preflight.
-    await this.assertGroupEmpty(credentials, account, group);
+    // Recheck the complete inventory when the queued task actually starts.
+    await this.assertGroupDeletionUnchanged(
+      credentials,
+      account,
+      group,
+      fingerprint,
+    );
     await this.operation(
       credentials,
       "DELETE",
@@ -606,18 +738,25 @@ export class Azure {
     );
     const result: { vm: VirtualMachine; raw: Json }[] = [];
     for (const raw of data) {
-      const { data: view } = await this.request(
-        credentials,
-        "GET",
+      const readOptional = async (path: string): Promise<Json> => {
+        try {
+          return (await this.request(credentials, "GET", path)).data;
+        } catch (error) {
+          // Partially provisioned VMs can lack an instance view, NIC or public IP.
+          // Permission, throttling and other failures must still reject the snapshot.
+          if (error instanceof AzureError && error.azureStatus === 404)
+            return {};
+          throw error;
+        }
+      };
+      const view = await readOptional(
         `${raw.id}/instanceView?api-version=${compute}`,
       );
       const publicIps: string[] = [],
         privateIps: string[] = [];
-      for (const nic of raw.properties.networkProfile?.networkInterfaces ??
+      for (const nic of raw.properties?.networkProfile?.networkInterfaces ??
         []) {
-        const { data: networkData } = await this.request(
-          credentials,
-          "GET",
+        const networkData = await readOptional(
           `${nic.id}?api-version=${network}`,
         );
         for (const config of networkData.properties?.ipConfigurations ?? []) {
@@ -625,11 +764,7 @@ export class Azure {
             privateIps.push(config.properties.privateIPAddress);
           const id = config.properties?.publicIPAddress?.id;
           if (id) {
-            const { data: ip } = await this.request(
-              credentials,
-              "GET",
-              `${id}?api-version=${network}`,
-            );
+            const ip = await readOptional(`${id}?api-version=${network}`);
             if (ip.properties?.ipAddress)
               publicIps.push(ip.properties.ipAddress);
           }
@@ -648,13 +783,13 @@ export class Azure {
           resourceGroup: raw.id.split("/")[4],
           resourceId: raw.id,
           location: raw.location,
-          size: raw.properties.hardwareProfile.vmSize,
-          os: raw.properties.storageProfile.osDisk.osType ?? "Unknown",
+          size: raw.properties?.hardwareProfile?.vmSize ?? "Unknown",
+          os: raw.properties?.storageProfile?.osDisk?.osType ?? "Unknown",
           powerState: powerState(view),
-          provisioningState: raw.properties.provisioningState ?? "Unknown",
+          provisioningState: raw.properties?.provisioningState ?? "Unknown",
           publicIps,
           privateIps,
-          diskSize: raw.properties.storageProfile.osDisk.diskSizeGB ?? 0,
+          diskSize: raw.properties?.storageProfile?.osDisk?.diskSizeGB ?? 0,
           tags: raw.tags ?? {},
           syncedAt: Date.now(),
         },
@@ -756,9 +891,11 @@ export class Azure {
       )
     )
       throw new AppError(409, "同名资源组已存在，请使用新的虚拟机名称");
-    for (const provider of ["Microsoft.Compute", "Microsoft.Network"]) {
+    const providers: Json[] = [];
+    progress("检查虚拟机、托管磁盘和网络资源的区域支持");
+    for (const provider of Object.keys(vmResourceTypes)) {
       const path = `/subscriptions/${account.subscriptionId}/providers/${provider}`;
-      const { data } = await this.request(
+      let { data } = await this.request(
         credentials,
         "GET",
         `${path}?api-version=${resources}`,
@@ -780,6 +917,7 @@ export class Azure {
             `${path}?api-version=${resources}`,
           );
           if (result.data.registrationState === "Registered") {
+            data = result.data;
             registered = true;
             break;
           }
@@ -790,44 +928,65 @@ export class Azure {
             `资源提供程序 ${provider} 仍在注册，请稍后重新创建`,
           );
       }
+      if (!Array.isArray(data.resourceTypes))
+        throw new AppError(
+          502,
+          "Azure 未返回资源类型区域信息，已停止创建，未创建资源组",
+        );
+      providers.push(data);
     }
+    const unsupported = unsupportedVmResources(input.location, providers);
+    if (unsupported.length)
+      throw new AppError(
+        422,
+        `当前订阅在区域 ${input.location} 不支持 ${unsupported.join("、")}。已停止创建，未创建资源组；请更换区域或联系 Azure 支持确认访问权限。`,
+      );
     const deployment = deploymentTemplate({ ...input, image: image.reference });
-    progress("创建独立资源组");
-    await this.operation(
-      credentials,
-      "PUT",
-      `${root}?api-version=${resources}`,
-      { location: input.location, tags: { managedBy: "azpanel" } },
-      progress,
-    );
-    progress("验证 Azure 部署模板");
-    await this.operation(
-      credentials,
-      "POST",
-      `${root}/providers/Microsoft.Resources/deployments/azpanel/validate?api-version=2022-09-01`,
-      {
-        properties: {
-          mode: "Incremental",
-          template: deployment.template,
-          parameters: deployment.parameters,
+    try {
+      progress("创建独立资源组");
+      await this.operation(
+        credentials,
+        "PUT",
+        `${root}?api-version=${resources}`,
+        { location: input.location, tags: { managedBy: "azpanel" } },
+        progress,
+      );
+      progress("验证 Azure 部署模板");
+      await this.operation(
+        credentials,
+        "POST",
+        `${root}/providers/Microsoft.Resources/deployments/azpanel/validate?api-version=2022-09-01`,
+        {
+          properties: {
+            mode: "Incremental",
+            template: deployment.template,
+            parameters: deployment.parameters,
+          },
         },
-      },
-      progress,
-    );
-    progress("提交部署：网络、安全组、公网 IP 和虚拟机");
-    await this.operation(
-      credentials,
-      "PUT",
-      `${root}/providers/Microsoft.Resources/deployments/azpanel?api-version=2022-09-01`,
-      {
-        properties: {
-          mode: "Incremental",
-          template: deployment.template,
-          parameters: deployment.parameters,
+        progress,
+      );
+      progress("提交部署：网络、安全组、公网 IP 和虚拟机");
+      await this.operation(
+        credentials,
+        "PUT",
+        `${root}/providers/Microsoft.Resources/deployments/azpanel?api-version=2022-09-01`,
+        {
+          properties: {
+            mode: "Incremental",
+            template: deployment.template,
+            parameters: deployment.parameters,
+          },
         },
-      },
-      progress,
-    );
+        progress,
+      );
+    } catch (error) {
+      if (error instanceof AppError)
+        throw new AppError(
+          error.status,
+          `${error.message}。资源组 ${input.name}-azpanel 可能有残留资源，请在资源浏览器核对清单后删除；不要重复提交同名创建。`,
+        );
+      throw error;
+    }
   }
   async vmAction(
     credentials: Credentials,
@@ -896,11 +1055,13 @@ export class Azure {
     credentials: Credentials,
     vm: VirtualMachine,
     progress: (message: string) => void,
+    force = false,
   ) {
+    progress(force ? "强制删除虚拟机（跳过正常关机）" : "删除虚拟机");
     await this.operation(
       credentials,
       "DELETE",
-      `${vm.resourceId}?api-version=${compute}`,
+      `${vm.resourceId}?api-version=${compute}${force ? "&forceDeletion=true" : ""}`,
       undefined,
       progress,
     );

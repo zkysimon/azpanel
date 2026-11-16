@@ -2,7 +2,7 @@
 import { buildApp } from "../server/app.js";
 import { Store } from "../server/store.js";
 import { Azure, RequestGate } from "../server/azure.js";
-import { account, credentials, machine, testConfig } from "./fixtures.js";
+import { account, credentials, machine, providerMetadata, testConfig } from "./fixtures.js";
 
 const aiRoot = `/subscriptions/${account.subscriptionId}/resourceGroups/ai-group/providers/Microsoft.CognitiveServices/accounts/test-ai`;
 const aiDeployments: Record<string, any> = {};
@@ -50,6 +50,10 @@ const azure = new Azure(
       return Response.json({ value: Object.values(vmDeployments) });
     if (path.endsWith("/instanceView"))
       return Response.json({ statuses: [{ code: "PowerState/running" }] });
+    if (path.includes("/virtualMachines/") && options?.method === "DELETE") {
+      delete vmDeployments[path];
+      return new Response(null, { status: 204 });
+    }
     if (
       path.endsWith("/providers/Microsoft.Resources/deployments/azpanel") &&
       options?.method === "PUT"
@@ -90,7 +94,7 @@ const azure = new Azure(
       path.endsWith("/providers/Microsoft.Compute") ||
       path.endsWith("/providers/Microsoft.Network")
     )
-      return Response.json({ registrationState: "Registered" });
+      return Response.json(providerMetadata(path.split("/").pop()!));
     if (
       !path.includes("/Microsoft.CognitiveServices/") &&
       (options?.method === "PUT" ||
@@ -175,7 +179,7 @@ const azure = new Azure(
     if (path.endsWith("/resources"))
       return Response.json({
         value: path.includes("/occupied/")
-          ? [{ name: "protected-disk", type: "Microsoft.Compute/disks" }]
+          ? [{ id: `/subscriptions/${account.subscriptionId}/resourceGroups/occupied/providers/Microsoft.Compute/disks/protected-disk`, name: "protected-disk", type: "Microsoft.Compute/disks" }]
           : [],
       });
     if (options?.method === "DELETE")

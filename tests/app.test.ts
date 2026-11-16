@@ -58,6 +58,13 @@ test("session, CSRF, tenant isolation, read-only gate, credential encryption, an
       payload: { action: "restart", confirmation: machine.name },
     });
     assert.equal(write.statusCode, 403);
+    for (const [url, payload] of [
+      [`/api/machines/${machine.id}/action`, { action: "delete", force: true, confirmation: machine.name }],
+      [`/api/accounts/${account.id}/groups`, { group: "occupied", fingerprint: "a".repeat(64), confirmation: "occupied" }],
+      [`/api/accounts/${account.id}/groups/delete-batch`, { groups: [{ group: "occupied", fingerprint: "a".repeat(64) }], confirmation: "DELETE" }],
+    ] as const) {
+      assert.equal((await app.inject({ method: url.endsWith("/groups") ? "DELETE" : "POST", url, headers, payload })).statusCode, 403);
+    }
     assert.equal(cloudCalls, 0);
     const other = store.createUser("other@example.test", "OtherPassword-1234");
     const otherLogin = await app.inject({

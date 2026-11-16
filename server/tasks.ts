@@ -13,7 +13,7 @@ export class Tasks {
     target: string,
     work: (
       progress: (message: string) => void,
-    ) => Promise<void | TaskItemResult[]>,
+    ) => Promise<void | TaskItemResult[] | { message: string }>,
   ) {
     if (this.pending >= 20)
       throw new AppError(429, "后台任务队列已满，请稍后再试");
@@ -51,7 +51,7 @@ export class Tasks {
         .run(Date.now(), id);
       try {
         const results = await work(progress);
-        if (results) {
+        if (Array.isArray(results)) {
           this.store.db
             .prepare(
               "INSERT OR REPLACE INTO task_results(task_id,data) VALUES(?,?)",
@@ -66,9 +66,13 @@ export class Tasks {
         }
         this.store.db
           .prepare(
-            "UPDATE tasks SET status='succeeded', progress='已完成', updated_at=? WHERE id=?",
+            "UPDATE tasks SET status='succeeded', progress=?, updated_at=? WHERE id=?",
           )
-          .run(Date.now(), id);
+          .run(
+            results && !Array.isArray(results) ? results.message : "已完成",
+            Date.now(),
+            id,
+          );
       } catch (error) {
         const message =
           error instanceof AppError

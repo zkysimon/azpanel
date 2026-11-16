@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Azure, RequestGate } from "../server/azure.js";
 import { createVmSchema } from "../shared/validation.js";
-import { account, credentials } from "./fixtures.js";
+import { account, credentials, providerMetadata } from "./fixtures.js";
 
 test("creation checks availability and group collision before submitting dependency-managed deployment", async () => {
   const requests: { method: string; url: string; body: any }[] = [];
@@ -61,7 +61,7 @@ test("creation checks availability and group collision before submitting depende
         path.includes("/providers/Microsoft.Compute?") ||
         path.includes("/providers/Microsoft.Network?")
       )
-        return Response.json({ registrationState: "Registered" });
+        return Response.json(providerMetadata(new URL(path).pathname.split("/").pop()!));
       return Response.json({ properties: { provisioningState: "Succeeded" } });
     },
     async () => "token",
