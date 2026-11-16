@@ -1716,53 +1716,56 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                     重新加载区域
                   </Button>
                 </div>
-                <TextField
-                  select
-                  label="系统镜像"
-                  value={
-                    images.some(
-                      (item) => imageValue(item) === imageValue(form.image),
-                    )
-                      ? imageValue(form.image)
-                      : ""
-                  }
-                  disabled={loadingImages || !images.length}
-                  onChange={(e) => {
-                    const option = images.find(
-                      (item) => imageValue(item) === e.target.value,
-                    );
-                    if (!option) return;
-                    field("image", option);
-                    if (looksLikeWindows(option))
-                      field("authentication", "password");
-                  }}
-                  helperText={
-                    imagesError ||
-                    (loadingImages
-                      ? "正在从 Azure 读取该区域镜像…"
-                      : "来自 Azure 的镜像目录，结果缓存 24 小时")
-                  }
-                >
-                  <MenuItem value="" disabled>
-                    请选择镜像
-                  </MenuItem>
-                  {images.map((option) => (
-                    <MenuItem
-                      key={imageValue(option)}
-                      value={imageValue(option)}
-                    >
-                      {option.label} · {option.osType}
-                    </MenuItem>
-                  ))}
-                </TextField>
-                {imagesError && (
-                  <Button
-                    onClick={() => setImageReload((value) => value + 1)}
-                    disabled={loadingImages}
+                <div>
+                  <TextField
+                    select
+                    label="系统镜像"
+                    value={
+                      images.some(
+                        (item) => imageValue(item) === imageValue(form.image),
+                      )
+                        ? imageValue(form.image)
+                        : ""
+                    }
+                    disabled={loadingImages || !images.length}
+                    error={!!imagesError}
+                    onChange={(e) => {
+                      const option = images.find(
+                        (item) => imageValue(item) === e.target.value,
+                      );
+                      if (!option) return;
+                      field("image", option);
+                      if (looksLikeWindows(option))
+                        field("authentication", "password");
+                    }}
+                    helperText={
+                      imagesError ||
+                      (loadingImages
+                        ? "正在从 Azure 读取该区域镜像…"
+                        : "来自 Azure 的镜像目录，结果缓存 24 小时")
+                    }
                   >
-                    重新加载镜像
-                  </Button>
-                )}
+                    <MenuItem value="" disabled>
+                      请选择镜像
+                    </MenuItem>
+                    {images.map((option) => (
+                      <MenuItem
+                        key={imageValue(option)}
+                        value={imageValue(option)}
+                      >
+                        {option.label} · {option.osType}
+                      </MenuItem>
+                    ))}
+                  </TextField>
+                  {imagesError && (
+                    <Button
+                      onClick={() => setImageReload((value) => value + 1)}
+                      disabled={loadingImages}
+                    >
+                      重新加载镜像
+                    </Button>
+                  )}
+                </div>
               </div>
             </Panel>
             <Panel
