@@ -71,6 +71,15 @@ export interface VmDeletionPreview {
   reason?: string;
   group?: GroupDeletionPreview;
 }
+export interface IpReplacementOption {
+  id: string;
+  version: "IPv4" | "IPv6";
+  address: string;
+  nicName: string;
+  configuration: string;
+  fingerprint: string;
+  unavailableReason?: string;
+}
 export interface User {
   id: string;
   email: string;

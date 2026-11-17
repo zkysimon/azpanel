@@ -31,6 +31,7 @@ import { Azure, RequestGate, selectSubscription } from "./azure.js";
 import { Tasks } from "./tasks.js";
 import { AzureAi } from "./azure-ai.js";
 import { AzureBilling } from "./azure-billing.js";
+import { AzureIp } from "./azure-ip.js";
 import type { BillingSummary } from "../shared/billing.js";
 import {
   aiServiceSchema,
@@ -65,6 +66,7 @@ export async function buildApp(
   const tasks = new Tasks(store);
   const ai = new AzureAi(azure, store);
   const billing = new AzureBilling(azure);
+  const ips = new AzureIp(azure);
   const billingLoads = new Map<string, Promise<BillingSummary>>();
   const app = Fastify({ logger: false, bodyLimit: 100_000, trustProxy: false });
   app.decorateRequest("currentUser", null);
@@ -730,6 +732,18 @@ export async function buildApp(
       vm,
     );
   });
+  app.get("/api/machines/:id/ip-options", async (request) => {
+    const { vm } = store.machine(
+      user(request).id,
+      idParams.parse(request.params).id,
+    );
+    const account = store.account(user(request).id, vm.accountId);
+    return ips.options(
+      store.credentials(user(request).id, vm.accountId),
+      account,
+      vm,
+    );
+  });
   app.post("/api/machines/:id/action", async (request) => {
     checkWrites();
     const { vm } = store.machine(
@@ -746,6 +760,7 @@ export async function buildApp(
           "delete",
           "resize",
           "disk",
+          "replaceIp",
         ]),
         confirmation: z.string(),
         size: sizeSchema.optional(),
@@ -757,6 +772,8 @@ export async function buildApp(
           .string()
           .regex(/^[a-f0-9]{64}$/)
           .optional(),
+        publicIpId: z.string().min(1).max(2048).optional(),
+        deleteOldIp: z.boolean().default(true),
       })
       .parse(request.body);
     confirm(input.confirmation, vm.name);
@@ -776,6 +793,11 @@ export async function buildApp(
       throw new AppError(422, "请选择新规格");
     if (input.action === "disk" && !input.diskSize)
       throw new AppError(422, "请选择新系统盘容量");
+    if (
+      input.action === "replaceIp" &&
+      (!input.publicIpId || !input.fingerprint)
+    )
+      throw new AppError(422, "请先读取并选择要更换的公网 IP");
     const account = store.account(user(request).id, vm.accountId),
       credentials = store.credentials(user(request).id, vm.accountId);
     if (input.cleanup)
@@ -793,10 +815,54 @@ export async function buildApp(
           ? "删除虚拟机及附属资源"
           : input.force
             ? "强制删除虚拟机"
-            : input.action,
+            : input.action === "replaceIp"
+              ? "更换公网 IP"
+              : input.action,
         vm.name,
         async (progress) => {
-          if (input.action === "delete") {
+          if (input.action === "replaceIp") {
+            let result;
+            try {
+              result = await ips.replace(
+                credentials,
+                account,
+                vm,
+                {
+                  id: input.publicIpId!,
+                  fingerprint: input.fingerprint!,
+                  deleteOld: input.deleteOldIp,
+                },
+                progress,
+              );
+            } catch (error) {
+              try {
+                await sync(user(request).id, account, credentials, progress);
+              } catch {
+                // Preserve the original network operation error.
+              }
+              throw error;
+            }
+            store.replacePublicIp(
+              account.id,
+              vm.id,
+              result.oldAddress,
+              result.newAddress,
+            );
+            try {
+              await sync(user(request).id, account, credentials, progress);
+              store.replacePublicIp(
+                account.id,
+                vm.id,
+                result.oldAddress,
+                result.newAddress,
+              );
+            } catch {
+              return {
+                message: `${result.message}其余资源同步失败，请在账户页重新同步。`,
+              };
+            }
+            return { message: result.message };
+          } else if (input.action === "delete") {
             if (input.cleanup) {
               try {
                 await azure.deleteVmAndResources(

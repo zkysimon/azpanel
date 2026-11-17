@@ -189,6 +189,7 @@ export class Azure {
     method: string,
     path: string,
     body?: unknown,
+    conditions?: { "If-Match"?: string; "If-None-Match"?: string },
   ): Promise<{ data: Json; headers: Headers; status: number }> {
     const url = armUrl(path);
     const token = await this.token(credentials);
@@ -201,6 +202,7 @@ export class Azure {
             headers: {
               Authorization: `Bearer ${token}`,
               "Content-Type": "application/json",
+              ...conditions,
             },
             body: body === undefined ? undefined : JSON.stringify(body),
             signal: AbortSignal.timeout(45000),
@@ -302,10 +304,11 @@ export class Azure {
     path: string,
     body?: unknown,
     progress?: (message: string) => void,
+    conditions?: { "If-Match"?: string; "If-None-Match"?: string },
   ): Promise<Json> {
     let initial;
     try {
-      initial = await this.request(credentials, method, path, body);
+      initial = await this.request(credentials, method, path, body, conditions);
     } catch (error) {
       // Only a 404 on the DELETE itself proves an already absent resource.
       // A missing operation-status endpoint is not proof of deletion.
@@ -806,9 +809,29 @@ export class Azure {
     const nicId = `${root}/providers/Microsoft.Network/networkInterfaces/${vm.name}-nic`;
     const vnetId = `${root}/providers/Microsoft.Network/virtualNetworks/${vm.name}-vnet`;
     const nsgId = `${root}/providers/Microsoft.Network/networkSecurityGroups/${vm.name}-nsg`;
+    const preview = await this.previewGroupDeletion(
+      credentials,
+      account,
+      vm.resourceGroup,
+    );
     const ipIds = ["ip", "ip6"].map((suffix) =>
       `${root}/providers/Microsoft.Network/publicIPAddresses/${vm.name}-${suffix}`.toLowerCase(),
     );
+    // Replacement IPs use unique names; trust only resources explicitly tagged
+    // for this VM, and still validate their live NIC association below.
+    for (const resource of preview.resources) {
+      if (
+        resource.type.toLowerCase() !== "microsoft.network/publicipaddresses" ||
+        ipIds.includes(resource.id.toLowerCase())
+      )
+        continue;
+      const ip = await readExisting(resource.id, network);
+      if (
+        ip.tags?.managedBy === "azpanel" &&
+        ip.tags?.azpanelVmId?.toLowerCase() === vm.resourceId.toLowerCase()
+      )
+        ipIds.push(resource.id.toLowerCase());
+    }
     for (const disk of disks) {
       if (disk?.vhd?.uri)
         return refuse(
@@ -905,11 +928,6 @@ export class Azure {
           "公网 IP 已关联其他网卡或服务，请在资源浏览器核对后清理。",
         );
     }
-    const preview = await this.previewGroupDeletion(
-      credentials,
-      account,
-      vm.resourceGroup,
-    );
     const allowed = new Set(
       [
         vm.resourceId,

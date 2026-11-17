@@ -270,6 +270,28 @@ export class Store {
       .prepare("DELETE FROM machines WHERE account_id=? AND id=?")
       .run(accountId, id);
   }
+  replacePublicIp(
+    accountId: string,
+    id: string,
+    oldAddress: string,
+    newAddress: string,
+  ) {
+    const row = this.db
+      .prepare("SELECT data FROM machines WHERE account_id=? AND id=?")
+      .get(accountId, id) as { data: string } | undefined;
+    if (!row) return;
+    const vm = JSON.parse(row.data) as VirtualMachine;
+    vm.publicIps = [
+      ...new Set([
+        ...vm.publicIps.filter((ip) => ip !== oldAddress),
+        newAddress,
+      ]),
+    ];
+    vm.syncedAt = Date.now();
+    this.db
+      .prepare("UPDATE machines SET data=? WHERE account_id=? AND id=?")
+      .run(JSON.stringify(vm), accountId, id);
+  }
   removeGroupMachines(accountId: string, group: string) {
     this.db
       .prepare(

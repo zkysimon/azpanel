@@ -16,7 +16,7 @@ const initial = [
   resource("Microsoft.Network/virtualNetworks", `${machine.name}-vnet`),
 ];
 function mock() {
-  const state = { inventory: [...initial], managed: true, externalDisk: false, sharedDisk: false, sharedNsg: false, peering: false, reads: 0, changeAfter: Infinity, failDelete: false };
+  const state = { inventory: [...initial], managed: true, externalDisk: false, sharedDisk: false, sharedNsg: false, peering: false, replacementId: "", reads: 0, changeAfter: Infinity, failDelete: false };
   const calls: { method: string; url: URL }[] = [];
   const azure = new Azure(new RequestGate(0), async (input, options) => {
     const url = new URL(String(input));
@@ -36,6 +36,8 @@ function mock() {
       state.reads++;
       return Response.json({ value: [...state.inventory, ...(state.reads > state.changeAfter ? [resource("Microsoft.Storage/storageAccounts", "unrelated")] : [])] });
     }
+    if (state.replacementId && url.pathname.toLowerCase() === state.replacementId.toLowerCase())
+      return Response.json({ tags: { managedBy: "azpanel", azpanelVmId: machine.resourceId } });
     if (url.pathname === initial[1].id) return Response.json({ properties: { maxShares: state.sharedDisk ? 2 : 1 } });
     if (url.pathname === initial[5].id) return Response.json({ properties: {
       networkInterfaces: state.sharedNsg ? [{ id: `${root}-other/providers/Microsoft.Network/networkInterfaces/shared-nic` }] : [],
@@ -102,6 +104,17 @@ test("normal cleanup never escalates to force and locked group failures do not r
   const deletes = calls.filter((call) => call.method === "DELETE");
   assert.equal(deletes.length, 1);
   assert.equal(deletes[0].url.searchParams.has("forceDeletionTypes"), false);
+});
+
+test("replacement public IPs remain eligible for confirmed VM cleanup only with matching VM ownership tags", async () => {
+  const { azure, state } = mock();
+  const replacement = resource("Microsoft.Network/publicIPAddresses", `${machine.name}-ip6-12345678`);
+  state.inventory.push(replacement);
+  assert.equal((await azure.previewVmDeletion(credentials, account, machine)).cleanupAvailable, false);
+  state.replacementId = replacement.id;
+  const preview = await azure.previewVmDeletion(credentials, account, machine);
+  assert.equal(preview.cleanupAvailable, true);
+  assert.ok(preview.group!.resources.some((item) => item.id === replacement.id));
 });
 
 test("VM cleanup API enforces ownership, explicit destructive confirmation and clears only the deleted group cache", async () => {

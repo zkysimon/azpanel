@@ -289,6 +289,28 @@ test("mobile members, credit card, multi-delete and AI deployments work together
 
   const vmRow = page.getByRole("row").filter({ has: page.getByRole("button", { name: "browser-vm", exact: true }) });
   await vmRow.getByLabel("管理").click();
+  await page.getByRole("option", { name: "更换公网 IP", exact: true }).click();
+  let ipDialog = page.getByRole("dialog");
+  await expect(ipDialog.getByRole("combobox", { name: "要更换的公网 IP" })).toContainText("IPv6");
+  await expect(ipDialog.getByRole("checkbox", { name: /新 IP 切换成功后删除旧公网 IP/ })).toBeChecked();
+  await expect(ipDialog.getByRole("button", { name: "确认执行" })).toBeDisabled();
+  await ipDialog.getByRole("button", { name: "取消", exact: true }).click();
+  await vmRow.getByLabel("管理").click();
+  await page.getByRole("option", { name: "更换公网 IP", exact: true }).click();
+  ipDialog = page.getByRole("dialog");
+  await expect(ipDialog.getByRole("combobox", { name: "要更换的公网 IP" })).toBeEnabled();
+  const selectedIp = await ipDialog.getByRole("combobox", { name: "要更换的公网 IP" }).textContent();
+  expect(selectedIp).toContain("IPv6");
+  await ipDialog.getByLabel("输入「browser-vm」确认").fill("browser-vm");
+  const replacement = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/action"));
+  await ipDialog.getByRole("button", { name: "确认执行" }).click();
+  expect((await replacement).postDataJSON()).toMatchObject({ action: "replaceIp", deleteOldIp: true });
+  await expect(page.getByRole("region", { name: "当前操作进度" })).toContainText("IPv6 已更换");
+  await expect(page.getByRole("region", { name: "当前操作进度" })).toContainText("旧公网 IP 已删除");
+  const newIp = await vmRow.locator(".mono").textContent();
+  expect(newIp).toMatch(/2001:db8::/);
+  expect(selectedIp).not.toContain(newIp!);
+  await vmRow.getByLabel("管理").click();
   await page.getByRole("option", { name: "删除虚拟机", exact: true }).click();
   const deleteVm = page.getByRole("dialog");
   const force = deleteVm.getByRole("checkbox", { name: /强制删除/ });
@@ -297,7 +319,7 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   await expect(deleteVm.getByText(/强制删除将跳过正常关机/)).toBeVisible();
   const cleanup = deleteVm.getByRole("checkbox", { name: /同时清理附属资源及独立资源组/ });
   await expect(cleanup).toBeChecked();
-  await expect(deleteVm.getByRole("table", { name: "虚拟机附属资源清单" })).toContainText("browser-vm-ip6");
+  await expect(deleteVm.getByRole("table", { name: "虚拟机附属资源清单" })).toContainText("browser-vm-ip6-");
   await expect(deleteVm.getByRole("table", { name: "虚拟机附属资源清单" })).toContainText("browser-vm_OsDisk_1_mock");
   await deleteVm.getByLabel("输入「browser-vm」确认").fill("browser-vm");
   await expect(deleteVm.getByRole("button", { name: "确认执行" })).toBeDisabled();

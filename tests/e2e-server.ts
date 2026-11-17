@@ -8,6 +8,9 @@ const aiRoot = `/subscriptions/${account.subscriptionId}/resourceGroups/ai-group
 const aiDeployments: Record<string, any> = {};
 const vmDeployments: Record<string, any> = {};
 const groupInventories: Record<string, any[]> = {};
+const networkResources: Record<string, any> = {};
+let ipCounter = 10;
+const mockAddress = (version: string) => version === "IPv6" ? `2001:db8::${++ipCounter}` : `203.0.113.${++ipCounter}`;
 
 const store = new Store(testConfig, true);
 const admin = store.db.prepare("SELECT id FROM users LIMIT 1").get() as {
@@ -47,6 +50,39 @@ const azure = new Azure(
   new RequestGate(0),
   async (url, options) => {
     const path = new URL(String(url)).pathname;
+    if (path.includes("/publicIPAddresses/") && options?.method === "PUT") {
+      const body = JSON.parse(String(options.body));
+      networkResources[path] = { ...body, id: path, name: path.split("/").pop(), etag: `"${++ipCounter}"`,
+        properties: { ...body.properties, provisioningState: "Succeeded", ipAddress: mockAddress(body.properties.publicIPAddressVersion) } };
+      const root = path.split("/providers/")[0];
+      groupInventories[root]?.push({ id: path, name: networkResources[path].name, type: "Microsoft.Network/publicIPAddresses" });
+      return Response.json(networkResources[path]);
+    }
+    if (path in networkResources && options?.method === "PUT" && path.includes("/networkInterfaces/")) {
+      const nic = networkResources[path];
+      const body = JSON.parse(String(options.body));
+      for (const config of nic.properties.ipConfigurations) {
+        const ip = networkResources[config.properties.publicIPAddress?.id];
+        if (ip) delete ip.properties.ipConfiguration;
+      }
+      nic.properties = { ...nic.properties, ...body.properties, provisioningState: "Succeeded" };
+      nic.etag = `"${++ipCounter}"`;
+      for (const config of nic.properties.ipConfigurations) {
+        const ip = networkResources[config.properties.publicIPAddress?.id];
+        if (ip) {
+          ip.properties.ipConfiguration = { id: `${path}/ipConfigurations/${config.name}` };
+          ip.etag = `"${++ipCounter}"`;
+        }
+      }
+      return Response.json(nic);
+    }
+    if (path in networkResources && options?.method === "GET") return Response.json(networkResources[path]);
+    if (path in networkResources && options?.method === "DELETE") {
+      delete networkResources[path];
+      const root = path.split("/providers/")[0];
+      if (groupInventories[root]) groupInventories[root] = groupInventories[root].filter((item) => item.id !== path);
+      return new Response(null, { status: 204 });
+    }
     if (path in vmDeployments && options?.method === "GET")
       return Response.json(vmDeployments[path]);
     if (path.endsWith("/resources")) {
@@ -60,6 +96,8 @@ const azure = new Azure(
       for (const id of Object.keys(vmDeployments))
         if (id.startsWith(path + "/")) delete vmDeployments[id];
       delete groupInventories[path];
+      for (const id of Object.keys(networkResources))
+        if (id.startsWith(path + "/")) delete networkResources[id];
       return new Response(null, { status: 204 });
     }
     if (path.endsWith("/virtualMachines"))
@@ -89,13 +127,36 @@ const azure = new Azure(
         id: `${root}/providers/${resource.type}/${resource.name}`,
         name: resource.name, type: resource.type,
       }));
+      const resolveId = (value: any): any => {
+        if (typeof value === "string") return value
+          .replace(/^\[resourceId\('Microsoft.Network\/virtualNetworks\/subnets', '([^']+)', '([^']+)'\)\]$/, `${root}/providers/Microsoft.Network/virtualNetworks/$1/subnets/$2`)
+          .replace(/^\[resourceId\('([^']+)', '([^']+)'\)\]$/, `${root}/providers/$1/$2`);
+        if (Array.isArray(value)) return value.map(resolveId);
+        if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, resolveId(item)]));
+        return value;
+      };
+      for (const resource of body.properties.template.resources.filter((item: any) => item.type.startsWith("Microsoft.Network/"))) {
+        const value = resolveId(resource);
+        const resourceId = `${root}/providers/${resource.type}/${resource.name}`;
+        networkResources[resourceId] = { ...value, id: resourceId, etag: `"${++ipCounter}"`,
+          properties: { ...value.properties, provisioningState: "Succeeded" } };
+        if (resource.type === "Microsoft.Network/publicIPAddresses") networkResources[resourceId].properties.ipAddress = mockAddress(resource.properties.publicIPAddressVersion);
+      }
+      const nicId = `${root}/providers/Microsoft.Network/networkInterfaces/${vm.name}-nic`;
+      const nic = networkResources[nicId];
+      nic.properties.virtualMachine = { id };
+      for (const config of nic.properties.ipConfigurations) {
+        config.properties.privateIPAddress = config.properties.privateIPAddressVersion === "IPv6" ? "fd00:42:0:1::4" : "10.42.0.4";
+        const ip = networkResources[config.properties.publicIPAddress?.id];
+        if (ip) ip.properties.ipConfiguration = { id: `${nicId}/ipConfigurations/${config.name}` };
+      }
       vmDeployments[id] = {
         ...vm,
         id,
         properties: {
           ...vm.properties,
           provisioningState: "Succeeded",
-          networkProfile: { networkInterfaces: [] },
+          networkProfile: { networkInterfaces: [{ id: nicId }] },
           storageProfile: {
             ...vm.properties.storageProfile,
             osDisk: { ...vm.properties.storageProfile.osDisk, osType: "Linux", name: disk.name, managedDisk: { id: diskId } },

@@ -111,6 +111,9 @@ import BillingCard from "./BillingCard.js";
 import RegionSelect from "./RegionSelect.js";
 import GroupDeleteDialog from "./GroupDeleteDialog.js";
 import VmCleanupOptions, { type VmCleanupChoice } from "./VmCleanupOptions.js";
+import IpReplacementOptions, {
+  type IpReplacementChoice,
+} from "./IpReplacementOptions.js";
 import InlineTask from "./InlineTask.js";
 import { useInlineTask } from "./useInlineTask.js";
 const MetricsChart = lazy(() => import("./MetricsChart.js"));
@@ -998,6 +1001,10 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
     cleanup: false,
     confirmed: false,
   });
+  const [ipReplacement, setIpReplacement] = useState<IpReplacementChoice>({
+    loading: true,
+    deleteOld: true,
+  });
   const operation = useInlineTask((task) => {
     reload();
     if (task.status === "succeeded") notify(task.progress);
@@ -1010,8 +1017,10 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
       group: params.get("group"),
     };
   }, []);
+  const openedRequestedMachine = useRef(false);
   useEffect(() => {
     if (
+      openedRequestedMachine.current ||
       !data ||
       !requestedMachine.accountId ||
       !requestedMachine.name ||
@@ -1027,8 +1036,10 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
         item.resourceGroup.toLowerCase() ===
           requestedMachine.group!.toLowerCase(),
     );
-    if (vm) setDetails(vm);
-    else notify("创建已完成，但列表中尚未找到对应虚拟机，请刷新资源列表");
+    if (vm) {
+      openedRequestedMachine.current = true;
+      setDetails(vm);
+    } else notify("创建已完成，但列表中尚未找到对应虚拟机，请刷新资源列表");
   }, [data, requestedMachine, notify]);
   const actionNames: Record<string, string> = {
     start: "启动虚拟机",
@@ -1037,6 +1048,7 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
     restart: "重启虚拟机",
     resize: "调整规格",
     disk: "扩容系统盘",
+    replaceIp: "更换公网 IP",
     delete: "删除虚拟机",
   };
   const descriptions: Record<string, string> = {
@@ -1046,6 +1058,8 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
     restart: "重启会暂时中断此虚拟机的服务。",
     resize: "变更规格可能重启虚拟机，并改变计费。",
     disk: "请先停止并释放虚拟机。系统盘只能扩容，扩容后需在操作系统内扩展分区。",
+    replaceIp:
+      "更换公网 IP 会断开现有 SSH/RDP 和业务连接。先创建新地址并切换，确认关联成功后按选择清理旧地址；虚拟机及磁盘不重建。请不要并发修改网卡。",
     delete:
       "删除虚拟机前会检查附属资源。面板独立资源组可核对清单后一并清理，避免磁盘和公网 IP 残留计费。",
   };
@@ -1155,6 +1169,7 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
                         setAction(e.target.value);
                         setConfirmation("");
                         setForceDelete(false);
+                        setIpReplacement({ loading: true, deleteOld: true });
                         setCleanup({
                           loading: true,
                           cleanup: false,
@@ -1203,6 +1218,8 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
         disabled={
           !session.writesEnabled ||
           operation.running ||
+          (action === "replaceIp" &&
+            (ipReplacement.loading || !ipReplacement.option)) ||
           (action === "delete" &&
             (cleanup.loading || (cleanup.cleanup && !cleanup.confirmed)))
         }
@@ -1226,6 +1243,13 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
                   : {}),
                 ...(action === "resize" ? { size } : {}),
                 ...(action === "disk" ? { diskSize: disk } : {}),
+                ...(action === "replaceIp"
+                  ? {
+                      publicIpId: ipReplacement.option!.id,
+                      fingerprint: ipReplacement.option!.fingerprint,
+                      deleteOldIp: ipReplacement.deleteOld,
+                    }
+                  : {}),
               },
             );
             operation.start({
@@ -1246,6 +1270,13 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
           }
         }}
       >
+        {action === "replaceIp" && selected && (
+          <IpReplacementOptions
+            vmId={selected.id}
+            value={ipReplacement}
+            onChange={setIpReplacement}
+          />
+        )}
         {action === "delete" && (
           <>
             {selected && (
