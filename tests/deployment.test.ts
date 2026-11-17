@@ -81,7 +81,6 @@ test("creation checks availability and group collision before submitting depende
     username: "azureuser",
     authentication: "password",
     password: "TestOnly!Password123",
-    allowedSource: "203.0.113.1/32",
   });
   await azure.create(credentials, account, input, () => {});
   const writes = requests.filter((request) => request.method !== "GET");

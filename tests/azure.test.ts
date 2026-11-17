@@ -143,7 +143,7 @@ test("credentials use authenticated encryption and password hashes are salted", 
   assert.ok(verifyPassword(password, hash));
   assert.ok(!verifyPassword("wrong", hash));
 });
-test("deployment uses static Standard IPs, explicit dependencies, restricted ingress and secureString password", () => {
+test("deployment uses static Standard IPs, explicit dependencies, open ingress and secureString password", () => {
   const input = createVmSchema.parse({
     name: "test-vm",
     confirmation: "test-vm",
@@ -159,7 +159,6 @@ test("deployment uses static Standard IPs, explicit dependencies, restricted ing
     username: "azureuser",
     authentication: "password",
     password: "TestOnly!Password123",
-    allowedSource: "203.0.113.1/32",
     ipv6: true,
   });
   const { template, parameters } = deploymentTemplate(input);
@@ -193,16 +192,74 @@ test("deployment uses static Standard IPs, explicit dependencies, restricted ing
   const nsg = template.resources.find(
     (resource) => resource.type === "Microsoft.Network/networkSecurityGroups",
   )!;
-  assert.equal(
-    nsg.properties.securityRules[0].properties.sourceAddressPrefix,
-    "203.0.113.1/32",
-  );
+  assert.deepEqual(nsg.properties.securityRules, [
+    {
+      name: "allow-all-inbound",
+      properties: {
+        priority: 100,
+        access: "Allow",
+        direction: "Inbound",
+        protocol: "*",
+        sourceAddressPrefix: "*",
+        sourcePortRange: "*",
+        destinationAddressPrefix: "*",
+        destinationPortRange: "*",
+      },
+    },
+  ]);
   assert.throws(() =>
     createVmSchema.parse({ ...input, confirmation: "wrong" }),
   );
-  assert.throws(() =>
-    createVmSchema.parse({ ...input, allowedSource: "999.1.1.1/999" }),
-  );
+});
+test("Linux and Windows, IPv4 and dual-stack all default to all inbound ports without CIDR configuration", () => {
+  for (const windows of [false, true]) {
+    for (const ipv6 of [false, true]) {
+      const base = {
+        name: "open-vm",
+        confirmation: "open-vm",
+        location: "eastasia",
+        size: "Standard_B1s",
+        image: windows
+          ? {
+              publisher: "MicrosoftWindowsServer",
+              offer: "WindowsServer",
+              sku: "2022-datacenter-g2",
+              version: "latest",
+            }
+          : {
+              publisher: "Canonical",
+              offer: "ubuntu-24_04-lts",
+              sku: "server",
+              version: "latest",
+            },
+        diskSize: 128,
+        username: "azureuser",
+        authentication: "password",
+        password: "TestOnly!Password123",
+        ipv6,
+      };
+      // Old clients/presets may still supply allowedSource; it must not silently
+      // reintroduce the old management-port-only or IPv4-only restriction.
+      for (const legacy of [{}, { allowedSource: "192.0.2.1/32" }]) {
+        const input = createVmSchema.parse({ ...base, ...legacy });
+        assert.equal("allowedSource" in input, false);
+        const resources = deploymentTemplate(input).template.resources;
+        const nsg = resources.find(
+          (item) => item.type === "Microsoft.Network/networkSecurityGroups",
+        )!;
+        const [rule] = nsg.properties.securityRules;
+        assert.equal(rule.properties.protocol, "*");
+        assert.equal(rule.properties.sourceAddressPrefix, "*");
+        assert.equal(rule.properties.destinationPortRange, "*");
+        assert.equal(
+          resources.filter(
+            (item) => item.type === "Microsoft.Network/publicIPAddresses",
+          ).length,
+          ipv6 ? 2 : 1,
+        );
+      }
+    }
+  }
 });
 test("SKU filter keeps Gen2 x64 images and drops Gen1/arm64", () => {
   assert.deepEqual(selectGen2Skus(["server", "server-gen1", "minimal-arm64"]), [

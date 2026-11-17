@@ -233,7 +233,10 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   await page
     .getByLabel("RSA SSH 公钥")
     .fill("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ== test@example");
-  await page.getByLabel("允许管理访问的来源 CIDR").fill("192.0.2.1/32");
+  await expect(page.getByLabel("允许管理访问的来源 CIDR")).toHaveCount(0);
+  await expect(
+    page.getByText(/安全组默认对所有来源开放全部入站端口和协议/),
+  ).toBeVisible();
   await page.getByLabel("再次输入虚拟机名称确认").fill("browser-vm");
   let releaseTask: () => void = () => {};
   const taskGate = new Promise<void>((resolve) => {
@@ -292,7 +295,6 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   await page
     .getByLabel("RSA SSH 公钥")
     .fill("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ== test@example");
-  await page.getByLabel("允许管理访问的来源 CIDR").fill("192.0.2.1/32");
   await page.getByLabel("再次输入虚拟机名称确认").fill("failed-browser-vm");
   await page.getByRole("button", { name: "创建虚拟机", exact: true }).click();
   await expect(

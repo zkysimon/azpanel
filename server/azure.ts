@@ -1076,7 +1076,6 @@ export function deploymentTemplate(input: CreateVm) {
     sku: input.image.sku,
     version: input.image.version || "latest",
   };
-  const windows = looksLikeWindows(input.image);
   const id = (type: string, suffix: string) =>
     `[resourceId('${type}', '${name}-${suffix}')]`;
   const nsg = id("Microsoft.Network/networkSecurityGroups", "nsg");
@@ -1094,16 +1093,16 @@ export function deploymentTemplate(input: CreateVm) {
       properties: {
         securityRules: [
           {
-            name: "admin-access",
+            name: "allow-all-inbound",
             properties: {
               priority: 100,
               access: "Allow",
               direction: "Inbound",
-              protocol: "Tcp",
-              sourceAddressPrefix: input.allowedSource,
+              protocol: "*",
+              sourceAddressPrefix: "*",
               sourcePortRange: "*",
               destinationAddressPrefix: "*",
-              destinationPortRange: windows ? "3389" : "22",
+              destinationPortRange: "*",
             },
           },
         ],

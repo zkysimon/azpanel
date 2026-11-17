@@ -303,7 +303,6 @@ try {
       authentication: "password",
       password: vmPassword,
       // Documentation-only source address prevents Internet login attempts during the short management test.
-      allowedSource: "192.0.2.1/32",
       ipv6: false,
       customData: "",
     });

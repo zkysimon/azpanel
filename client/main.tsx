@@ -1395,7 +1395,6 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     authentication: "ssh",
     sshKey: "",
     password: "",
-    allowedSource: "",
     ipv6: false,
     customData: "",
     confirmation: "",
@@ -1445,7 +1444,6 @@ function CreatePage({ session, notify, navigate }: PageProps) {
         authentication: form.authentication,
         sshKey: form.sshKey,
         password: form.password,
-        allowedSource: form.allowedSource,
         ipv6: form.ipv6,
         customData: form.customData,
       },
@@ -1879,22 +1877,21 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                   )}
                 </div>
                 <TextField
-                  label="允许管理访问的来源 CIDR"
-                  required
-                  value={form.allowedSource}
-                  onChange={(e) => field("allowedSource", e.target.value)}
-                  placeholder="203.0.113.10/32"
-                  helperText="仅开放 SSH 22 或 RDP 3389；0.0.0.0/0 代表所有 IPv4"
-                />
-                <TextField
+                  className="span-two"
                   label="网络协议"
                   select
                   value={String(form.ipv6)}
                   onChange={(e) => field("ipv6", e.target.value === "true")}
+                  helperText="Standard 公网 IPv4 按时计费；IPv6 地址本身免费，流量及关联资源另计"
                 >
                   <MenuItem value="false">IPv4</MenuItem>
                   <MenuItem value="true">IPv4 + IPv6</MenuItem>
                 </TextField>
+                <Alert severity="warning" className="span-two">
+                  新建虚拟机的安全组默认对所有来源开放全部入站端口和协议，启用
+                  IPv6 时也放行
+                  IPv6。请保护好数据库等服务；系统内防火墙和服务监听设置仍然有效。
+                </Alert>
                 <div className="span-two">
                   <TextField
                     label="cloud-init / 启动脚本（选填）"
@@ -1937,6 +1934,10 @@ function CreatePage({ session, notify, navigate }: PageProps) {
               <div className="summary-row">
                 <span>公网 IP</span>
                 <b>Standard · 静态</b>
+              </div>
+              <div className="summary-row">
+                <span>入站规则</span>
+                <b>所有来源 · 全端口 / 全协议</b>
               </div>
               <Divider sx={{ my: 3 }} />
               <Alert severity="warning">

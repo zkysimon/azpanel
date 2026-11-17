@@ -128,7 +128,6 @@ test("image validation resolves a bare version array then GETs the specific imag
     diskSize: 30,
     authentication: "password",
     password: "Synthetic123!Password",
-    allowedSource: "192.0.2.1/32",
   });
   const vm = deploymentTemplate(input).template.resources.find(
     (item) => item.type === "Microsoft.Compute/virtualMachines",
@@ -213,7 +212,6 @@ test("logical regions cannot trigger VM creation even with syntactically valid i
     diskSize: 30,
     authentication: "password",
     password: "Synthetic123!Password",
-    allowedSource: "192.0.2.1/32",
   });
   await assert.rejects(
     azure.create(credentials, account, input, () => {}),

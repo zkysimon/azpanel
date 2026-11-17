@@ -10,7 +10,6 @@ const input = createVmSchema.parse({
   name: "test-vm", confirmation: "test-vm", location: "taiwannorth", size: "Standard_B1s",
   image: { publisher: "Canonical", offer: "ubuntu-24_04-lts", sku: "server", version: "24.04.1" },
   diskSize: 30, username: "azureuser", authentication: "password", password: "TestOnly!Password123",
-  allowedSource: "203.0.113.1/32",
 });
 
 test("a physical Taiwan region without managed disks is excluded and rejected before any deployment write", async () => {

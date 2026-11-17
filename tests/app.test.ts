@@ -244,7 +244,6 @@ test("presets save, encrypt, isolate per user, and keep a single default", async
     authentication: "password",
     sshKey: "",
     password: "Preset!Password123",
-    allowedSource: "203.0.113.1/32",
     ipv6: false,
     customData: "",
   };
@@ -348,7 +347,7 @@ test("presets save, encrypt, isolate per user, and keep a single default", async
           headers,
           payload: {
             name: "坏预设",
-            settings: { ...settings, allowedSource: "999.1.1.1/99" },
+            settings: { ...settings, username: "root" },
           },
         })
       ).statusCode,

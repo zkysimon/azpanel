@@ -32,17 +32,6 @@ export const usernameSchema = z
       ].includes(value),
     "请使用自定义管理员用户名",
   );
-export const cidrSchema = z.string().refine((value) => {
-  const parts = value.split("/");
-  return (
-    parts.length === 2 &&
-    parts[0].split(".").length === 4 &&
-    parts[0].split(".").every((v) => /^\d{1,3}$/.test(v) && +v <= 255) &&
-    /^\d{1,2}$/.test(parts[1]) &&
-    +parts[1] <= 32
-  );
-}, "请输入有效 IPv4 CIDR，例如 203.0.113.10/32");
-
 /** Reusable creation settings, shared by the wizard and saved presets. */
 export const vmSettingsSchema = z
   .object({
@@ -54,7 +43,6 @@ export const vmSettingsSchema = z
     authentication: z.enum(["ssh", "password"]),
     sshKey: z.string().max(16384).default(""),
     password: z.string().max(123).default(""),
-    allowedSource: cidrSchema,
     ipv6: z.boolean().default(false),
     customData: z.string().max(45000).default(""),
   })
