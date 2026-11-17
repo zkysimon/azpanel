@@ -237,6 +237,14 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   await expect(
     page.getByText(/安全组默认对所有来源开放全部入站端口和协议/),
   ).toBeVisible();
+  await page.getByRole("combobox", { name: "网络协议" }).click();
+  await page
+    .getByRole("option", { name: "仅公网 IPv6（保留内网 IPv4）", exact: true })
+    .click();
+  await expect(
+    page.getByText("仅 IPv6 · Standard 静态", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText(/连接端必须支持\s*IPv6/)).toBeVisible();
   await page.getByLabel("再次输入虚拟机名称确认").fill("browser-vm");
   let releaseTask: () => void = () => {};
   const taskGate = new Promise<void>((resolve) => {
@@ -246,7 +254,16 @@ test("mobile members, credit card, multi-delete and AI deployments work together
     await taskGate;
     await route.continue();
   });
+  const creationRequest = page.waitForRequest(
+    (request) =>
+      request.method() === "POST" &&
+      /\/api\/accounts\/[^/]+\/machines$/.test(request.url()),
+  );
   await page.getByRole("button", { name: "创建虚拟机", exact: true }).click();
+  expect((await creationRequest).postDataJSON()).toMatchObject({
+    publicIpv4: false,
+    ipv6: true,
+  });
   await expect(
     page.getByRole("region", { name: "当前操作进度" }),
   ).toContainText("browser-vm");
@@ -278,11 +295,20 @@ test("mobile members, credit card, multi-delete and AI deployments work together
   await expect(force).not.toBeChecked();
   await force.check();
   await expect(deleteVm.getByText(/强制删除将跳过正常关机/)).toBeVisible();
+  const cleanup = deleteVm.getByRole("checkbox", { name: /同时清理附属资源及独立资源组/ });
+  await expect(cleanup).toBeChecked();
+  await expect(deleteVm.getByRole("table", { name: "虚拟机附属资源清单" })).toContainText("browser-vm-ip6");
+  await expect(deleteVm.getByRole("table", { name: "虚拟机附属资源清单" })).toContainText("browser-vm_OsDisk_1_mock");
   await deleteVm.getByLabel("输入「browser-vm」确认").fill("browser-vm");
+  await expect(deleteVm.getByRole("button", { name: "确认执行" })).toBeDisabled();
+  await cleanup.uncheck();
+  await expect(deleteVm.getByText(/仅删除 VM；保留项/)).toBeVisible();
+  await cleanup.check();
+  await deleteVm.getByRole("checkbox", { name: "我已核对清单，确认永久删除虚拟机及上述全部附属资源和数据" }).check();
   const deletionRequest = page.waitForRequest((request) => request.method() === "POST" && request.url().endsWith("/action"));
   await deleteVm.getByRole("button", { name: "确认执行" }).click();
-  expect((await deletionRequest).postDataJSON()).toMatchObject({ action: "delete", force: true });
-  await expect(page.getByRole("region", { name: "当前操作进度" })).toContainText("已完成");
+  expect((await deletionRequest).postDataJSON()).toMatchObject({ action: "delete", force: true, cleanup: true, cleanupConfirmed: true });
+  await expect(page.getByRole("region", { name: "当前操作进度" })).toContainText("独立资源组已清理");
   await expect(page.getByRole("button", { name: "browser-vm", exact: true })).toHaveCount(0);
 
   // A failed creation remains in the wizard with its entered values.

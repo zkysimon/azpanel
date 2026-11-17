@@ -10,6 +10,7 @@ import type {
   Sku,
   Subscription,
   VirtualMachine,
+  VmDeletionPreview,
 } from "../shared/types.js";
 import type { CreateVm } from "../shared/validation.js";
 import {
@@ -338,8 +339,10 @@ export class Azure {
       return initial.data;
     const deadline = Date.now() + 10 * 60_000;
     const pollUrl = armUrl(async ?? location ?? path);
-    if (method === "DELETE" && !async && !location)
+    if (method === "DELETE" && !async && !location) {
       pollUrl.searchParams.delete("forceDeletion");
+      pollUrl.searchParams.delete("forceDeletionTypes");
+    }
     const pollPath = pollUrl.href;
     if (!async && !location && method === "POST")
       throw new AppError(
@@ -712,6 +715,7 @@ export class Azure {
     group: string,
     fingerprint: string,
     progress?: (message: string) => void,
+    forceVmDeletion = false,
   ) {
     // Recheck the complete inventory when the queued task actually starts.
     await this.assertGroupDeletionUnchanged(
@@ -723,9 +727,249 @@ export class Azure {
     await this.operation(
       credentials,
       "DELETE",
-      `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(group)}?api-version=${resources}`,
+      `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(group)}?api-version=${resources}${forceVmDeletion ? "&forceDeletionTypes=Microsoft.Compute%2FvirtualMachines" : ""}`,
       undefined,
       progress,
+    );
+  }
+  async previewVmDeletion(
+    credentials: Credentials,
+    account: Account,
+    vm: VirtualMachine,
+  ): Promise<VmDeletionPreview> {
+    const refuse = (reason: string): VmDeletionPreview => ({
+      cleanupAvailable: false,
+      reason,
+    });
+    if (vm.resourceGroup.toLowerCase() !== `${vm.name}-azpanel`.toLowerCase())
+      return refuse(
+        "此虚拟机不在面板创建的独立资源组中，不能自动整组清理；仅删除 VM 不会清理保留的磁盘、公网 IP 等资源。",
+      );
+    const root = `/subscriptions/${account.subscriptionId}/resourceGroups/${encodeURIComponent(vm.resourceGroup)}`;
+    let group: Json, fresh: Json;
+    try {
+      group = (
+        await this.request(
+          credentials,
+          "GET",
+          `${root}?api-version=${resources}`,
+        )
+      ).data;
+      fresh = (
+        await this.request(
+          credentials,
+          "GET",
+          `${vm.resourceId}?api-version=${compute}`,
+        )
+      ).data;
+    } catch (error) {
+      if (error instanceof AzureError && error.azureStatus === 404)
+        return refuse(
+          "云端虚拟机或资源组已不存在，请同步账户；残留资源可在资源浏览器核对后清理。",
+        );
+      throw error;
+    }
+    if (
+      group.tags?.managedBy !== "azpanel" ||
+      fresh.tags?.managedBy !== "azpanel"
+    )
+      return refuse(
+        "无法确认虚拟机和资源组均由面板创建，已禁用自动整组清理；仍可仅删除虚拟机。",
+      );
+    const prefix = `${root}/providers/`.toLowerCase();
+    const disks = [
+      fresh.properties?.storageProfile?.osDisk,
+      ...(fresh.properties?.storageProfile?.dataDisks ?? []),
+    ];
+    const attachments = [
+      ...disks.flatMap((disk: Json) =>
+        disk?.managedDisk?.id ? [disk.managedDisk.id] : [],
+      ),
+      ...(fresh.properties?.networkProfile?.networkInterfaces ?? []).map(
+        (nic: Json) => nic.id,
+      ),
+    ];
+    if (attachments.some((id: string) => !id?.toLowerCase().startsWith(prefix)))
+      return refuse(
+        "虚拟机关联了其他资源组中的磁盘或网卡，可能包含共享资源；请仅删除 VM 后在资源浏览器逐项处理。",
+      );
+    const readExisting = async (id: string, version: string): Promise<Json> => {
+      try {
+        return (
+          await this.request(credentials, "GET", `${id}?api-version=${version}`)
+        ).data;
+      } catch (error) {
+        if (error instanceof AzureError && error.azureStatus === 404) return {};
+        throw error;
+      }
+    };
+    const nicId = `${root}/providers/Microsoft.Network/networkInterfaces/${vm.name}-nic`;
+    const vnetId = `${root}/providers/Microsoft.Network/virtualNetworks/${vm.name}-vnet`;
+    const nsgId = `${root}/providers/Microsoft.Network/networkSecurityGroups/${vm.name}-nsg`;
+    const ipIds = ["ip", "ip6"].map((suffix) =>
+      `${root}/providers/Microsoft.Network/publicIPAddresses/${vm.name}-${suffix}`.toLowerCase(),
+    );
+    for (const disk of disks) {
+      if (disk?.vhd?.uri)
+        return refuse(
+          "虚拟机使用非托管磁盘，无法从此处确认其数据归属，请在资源浏览器核对后清理。",
+        );
+      const diskId =
+        disk?.managedDisk?.id ??
+        (disk?.name
+          ? `${root}/providers/Microsoft.Compute/disks/${disk.name}`
+          : undefined);
+      if (diskId) {
+        const current = await readExisting(diskId, "2024-03-02");
+        if (
+          Number(current.properties?.maxShares ?? 1) > 1 ||
+          (current.managedBy &&
+            current.managedBy.toLowerCase() !== vm.resourceId.toLowerCase())
+        )
+          return refuse(
+            "虚拟机关联的磁盘可能被其他虚拟机共享，已禁用自动整组清理。",
+          );
+      }
+    }
+    for (const nic of fresh.properties?.networkProfile?.networkInterfaces ??
+      []) {
+      if (nic.id?.toLowerCase() !== nicId.toLowerCase())
+        return refuse(
+          "虚拟机关联了非预期网卡，请在资源浏览器核对是否存在共享资源后清理。",
+        );
+      const current = await readExisting(nic.id, network);
+      if (
+        current.properties?.networkSecurityGroup?.id &&
+        current.properties.networkSecurityGroup.id.toLowerCase() !==
+          nsgId.toLowerCase()
+      )
+        return refuse("网卡使用了非预期安全组，已禁用自动整组清理。");
+      for (const config of current.properties?.ipConfigurations ?? []) {
+        const properties = config.properties ?? {};
+        if (
+          (properties.subnet?.id &&
+            properties.subnet.id.toLowerCase() !==
+              `${vnetId}/subnets/default`.toLowerCase()) ||
+          (properties.publicIPAddress?.id &&
+            !ipIds.includes(properties.publicIPAddress.id.toLowerCase())) ||
+          properties.loadBalancerBackendAddressPools?.length ||
+          properties.loadBalancerInboundNatRules?.length ||
+          properties.applicationGatewayBackendAddressPools?.length
+        )
+          return refuse(
+            "网卡使用了非预期或共享的网络资源，请在资源浏览器核对后清理。",
+          );
+      }
+    }
+    const vnet = await readExisting(vnetId, network);
+    if (
+      vnet.properties?.virtualNetworkPeerings?.length ||
+      vnet.properties?.subnets?.some(
+        (subnet: Json) =>
+          subnet.properties?.ipConfigurations?.some(
+            (config: Json) =>
+              !config.id
+                ?.toLowerCase()
+                .startsWith(`${nicId}/ipConfigurations/`.toLowerCase()),
+          ) ||
+          subnet.properties?.resourceNavigationLinks?.length ||
+          subnet.properties?.serviceAssociationLinks?.length,
+      )
+    )
+      return refuse(
+        "虚拟网络存在对等连接或其他关联资源，请在资源浏览器核对共享关系后清理。",
+      );
+    const nsg = await readExisting(nsgId, network);
+    if (
+      nsg.properties?.networkInterfaces?.some(
+        (nic: Json) => nic.id?.toLowerCase() !== nicId.toLowerCase(),
+      ) ||
+      nsg.properties?.subnets?.some(
+        (subnet: Json) =>
+          !subnet.id
+            ?.toLowerCase()
+            .startsWith(`${vnetId}/subnets/`.toLowerCase()),
+      )
+    )
+      return refuse("安全组被其他网卡或虚拟网络共享，已禁用自动整组清理。");
+    for (const id of ipIds) {
+      const current = await readExisting(id, network);
+      const configId = current.properties?.ipConfiguration?.id;
+      if (
+        configId &&
+        !configId
+          .toLowerCase()
+          .startsWith(`${nicId}/ipConfigurations/`.toLowerCase())
+      )
+        return refuse(
+          "公网 IP 已关联其他网卡或服务，请在资源浏览器核对后清理。",
+        );
+    }
+    const preview = await this.previewGroupDeletion(
+      credentials,
+      account,
+      vm.resourceGroup,
+    );
+    const allowed = new Set(
+      [
+        vm.resourceId,
+        nsgId,
+        ...ipIds,
+        vnetId,
+        nicId,
+        ...attachments,
+        ...disks.flatMap((disk: Json) =>
+          disk?.name
+            ? [`${root}/providers/Microsoft.Compute/disks/${disk.name}`]
+            : [],
+        ),
+      ].map((id) => id.toLowerCase()),
+    );
+    const unknown = preview.resources.filter(
+      (item) => !allowed.has(item.id.toLowerCase()),
+    );
+    if (unknown.length)
+      return refuse(
+        `资源组包含无法确认归属的资源：${unknown.map((item) => `${item.name}（${item.type}）`).join("、")}。为避免误删，不能从 VM 页面自动清理；请前往资源浏览器核对整组清单。`,
+      );
+    if (
+      !preview.resources.some(
+        (item) => item.id.toLowerCase() === vm.resourceId.toLowerCase(),
+      )
+    )
+      return refuse("资源清单中未找到当前虚拟机，请同步后重新操作。");
+    return { cleanupAvailable: true, group: preview };
+  }
+  async assertVmCleanupUnchanged(
+    credentials: Credentials,
+    account: Account,
+    vm: VirtualMachine,
+    fingerprint: string,
+  ) {
+    const preview = await this.previewVmDeletion(credentials, account, vm);
+    if (!preview.cleanupAvailable || preview.group?.fingerprint !== fingerprint)
+      throw new AppError(
+        409,
+        preview.reason ?? "附属资源清单已变化，请重新打开删除弹窗核对并确认",
+      );
+  }
+  async deleteVmAndResources(
+    credentials: Credentials,
+    account: Account,
+    vm: VirtualMachine,
+    fingerprint: string,
+    progress: (message: string) => void,
+    force = false,
+  ) {
+    await this.assertVmCleanupUnchanged(credentials, account, vm, fingerprint);
+    progress(`删除虚拟机及独立资源组 ${vm.resourceGroup} 内的全部资源`);
+    await this.deleteGroup(
+      credentials,
+      account,
+      vm.resourceGroup,
+      fingerprint,
+      progress,
+      force,
     );
   }
   async machines(
@@ -1109,17 +1353,6 @@ export function deploymentTemplate(input: CreateVm) {
       },
     },
     {
-      type: "Microsoft.Network/publicIPAddresses",
-      apiVersion: network,
-      name: `${name}-ip`,
-      location: input.location,
-      sku: { name: "Standard" },
-      properties: {
-        publicIPAllocationMethod: "Static",
-        publicIPAddressVersion: "IPv4",
-      },
-    },
-    {
       type: "Microsoft.Network/virtualNetworks",
       apiVersion: network,
       name: `${name}-vnet`,
@@ -1148,7 +1381,12 @@ export function deploymentTemplate(input: CreateVm) {
       apiVersion: network,
       name: `${name}-nic`,
       location: input.location,
-      dependsOn: [nsg, ip, vnet, ...(input.ipv6 ? [ip6] : [])],
+      dependsOn: [
+        nsg,
+        vnet,
+        ...(input.publicIpv4 ? [ip] : []),
+        ...(input.ipv6 ? [ip6] : []),
+      ],
       properties: {
         networkSecurityGroup: { id: nsg },
         ipConfigurations: [
@@ -1159,7 +1397,7 @@ export function deploymentTemplate(input: CreateVm) {
               privateIPAllocationMethod: "Dynamic",
               privateIPAddressVersion: "IPv4",
               subnet: { id: subnet },
-              publicIPAddress: { id: ip },
+              ...(input.publicIpv4 ? { publicIPAddress: { id: ip } } : {}),
             },
           },
           ...(input.ipv6
@@ -1227,6 +1465,18 @@ export function deploymentTemplate(input: CreateVm) {
       },
     },
   ];
+  if (input.publicIpv4)
+    templateResources.push({
+      type: "Microsoft.Network/publicIPAddresses",
+      apiVersion: network,
+      name: `${name}-ip`,
+      location: input.location,
+      sku: { name: "Standard" },
+      properties: {
+        publicIPAllocationMethod: "Static",
+        publicIPAddressVersion: "IPv4",
+      },
+    });
   if (input.ipv6)
     templateResources.push({
       type: "Microsoft.Network/publicIPAddresses",

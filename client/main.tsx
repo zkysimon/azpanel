@@ -110,6 +110,7 @@ import "./styles.css";
 import BillingCard from "./BillingCard.js";
 import RegionSelect from "./RegionSelect.js";
 import GroupDeleteDialog from "./GroupDeleteDialog.js";
+import VmCleanupOptions, { type VmCleanupChoice } from "./VmCleanupOptions.js";
 import InlineTask from "./InlineTask.js";
 import { useInlineTask } from "./useInlineTask.js";
 const MetricsChart = lazy(() => import("./MetricsChart.js"));
@@ -992,6 +993,11 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
     [disk, setDisk] = useState(64),
     [forceDelete, setForceDelete] = useState(false),
     [details, setDetails] = useState<VirtualMachine | null>(null);
+  const [cleanup, setCleanup] = useState<VmCleanupChoice>({
+    loading: true,
+    cleanup: false,
+    confirmed: false,
+  });
   const operation = useInlineTask((task) => {
     reload();
     if (task.status === "succeeded") notify(task.progress);
@@ -1041,7 +1047,7 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
     resize: "变更规格可能重启虚拟机，并改变计费。",
     disk: "请先停止并释放虚拟机。系统盘只能扩容，扩容后需在操作系统内扩展分区。",
     delete:
-      "删除此虚拟机。磁盘与网卡是否保留取决于现有 Azure deleteOption；请先确认备份。",
+      "删除虚拟机前会检查附属资源。面板独立资源组可核对清单后一并清理，避免磁盘和公网 IP 残留计费。",
   };
   return (
     <>
@@ -1149,6 +1155,11 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
                         setAction(e.target.value);
                         setConfirmation("");
                         setForceDelete(false);
+                        setCleanup({
+                          loading: true,
+                          cleanup: false,
+                          confirmed: false,
+                        });
                         setSize(vm.size);
                         setDisk(vm.diskSize + 32);
                       }}
@@ -1189,7 +1200,12 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
         value={confirmation}
         onChange={setConfirmation}
         onClose={() => setSelected(null)}
-        disabled={!session.writesEnabled || operation.running}
+        disabled={
+          !session.writesEnabled ||
+          operation.running ||
+          (action === "delete" &&
+            (cleanup.loading || (cleanup.cleanup && !cleanup.confirmed)))
+        }
         onConfirm={async () => {
           try {
             const result = await api<{ taskId: string }>(
@@ -1198,7 +1214,16 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
               {
                 action,
                 confirmation,
-                ...(action === "delete" ? { force: forceDelete } : {}),
+                ...(action === "delete"
+                  ? {
+                      force: forceDelete,
+                      cleanup: cleanup.cleanup,
+                      cleanupConfirmed: cleanup.confirmed,
+                      ...(cleanup.cleanup
+                        ? { fingerprint: cleanup.preview!.group!.fingerprint }
+                        : {}),
+                    }
+                  : {}),
                 ...(action === "resize" ? { size } : {}),
                 ...(action === "disk" ? { diskSize: disk } : {}),
               },
@@ -1207,7 +1232,12 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
               id: result.taskId,
               accountId: selected!.accountId,
               target: selected!.name,
-              kind: forceDelete ? "强制删除虚拟机" : actionNames[action],
+              kind:
+                cleanup.cleanup && action === "delete"
+                  ? "删除虚拟机及附属资源"
+                  : forceDelete
+                    ? "强制删除虚拟机"
+                    : actionNames[action],
             });
             setSelected(null);
             notify("操作已加入后台任务队列");
@@ -1218,6 +1248,13 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
       >
         {action === "delete" && (
           <>
+            {selected && (
+              <VmCleanupOptions
+                vm={selected}
+                value={cleanup}
+                onChange={setCleanup}
+              />
+            )}
             <FormControlLabel
               control={
                 <Checkbox
@@ -1230,7 +1267,7 @@ function MachinesPage({ notify, navigate, session, revision }: PageProps) {
             {forceDelete && (
               <Alert severity="error">
                 强制删除将跳过正常关机及部分清理步骤。仅在不需要恢复磁盘数据时使用，不会绕过
-                Azure 权限或资源锁；不会自动删除整个资源组。
+                Azure 权限或资源锁。清理范围以上方确认的清单为准。
               </Alert>
             )}
           </>
@@ -1380,6 +1417,7 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     [presets, setPresets] = useState<VmPreset[]>([]),
     [presetId, setPresetId] = useState(""),
     [saveOpen, setSaveOpen] = useState(false),
+    [presetSaveId, setPresetSaveId] = useState<string | null>(null),
     [presetName, setPresetName] = useState(""),
     [presetDefault, setPresetDefault] = useState(false),
     [presetBusy, setPresetBusy] = useState(false),
@@ -1395,6 +1433,7 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     authentication: "ssh",
     sshKey: "",
     password: "",
+    publicIpv4: true,
     ipv6: false,
     customData: "",
     confirmation: "",
@@ -1417,8 +1456,14 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     sku: string;
   }) => `${option.publisher}|${option.offer}|${option.sku}`;
   const windows = looksLikeWindows(form.image);
+  const networkMode = !form.publicIpv4 ? "ipv6" : form.ipv6 ? "dual" : "ipv4";
   const applyPreset = (preset: VmPreset) => {
-    setForm((old) => ({ ...old, ...preset.settings }));
+    setForm((old) => ({
+      ...old,
+      ...preset.settings,
+      // Presets saved before public-IPv6-only support always created public IPv4.
+      publicIpv4: preset.settings.publicIpv4 ?? true,
+    }));
     setPresetId(preset.id);
   };
   // Presets are personal saved settings so the wizard does not need re-typing.
@@ -1444,6 +1489,7 @@ function CreatePage({ session, notify, navigate }: PageProps) {
         authentication: form.authentication,
         sshKey: form.sshKey,
         password: form.password,
+        publicIpv4: form.publicIpv4,
         ipv6: form.ipv6,
         customData: form.customData,
       },
@@ -1451,12 +1497,21 @@ function CreatePage({ session, notify, navigate }: PageProps) {
     setPresetBusy(true);
     setPresetError("");
     try {
-      const existing = presets.find((preset) => preset.id === presetId);
+      const existing = presets.find((preset) => preset.id === presetSaveId);
+      if (presetSaveId && !existing)
+        throw new Error("待更新的预设已不存在，请关闭弹窗后重新选择");
       const saved = existing
         ? await api<VmPreset>(`/presets/${existing.id}`, "PUT", input)
         : await api<VmPreset>("/presets", "POST", input);
       setPresets((list) =>
-        [...list.filter((preset) => preset.id !== saved.id), saved].sort(
+        [
+          ...list
+            .filter((preset) => preset.id !== saved.id)
+            .map((preset) =>
+              saved.isDefault ? { ...preset, isDefault: false } : preset,
+            ),
+          saved,
+        ].sort(
           (a, b) =>
             Number(b.isDefault) - Number(a.isDefault) ||
             b.updatedAt - a.updatedAt,
@@ -1641,14 +1696,29 @@ function CreatePage({ session, notify, navigate }: PageProps) {
           <Button
             startIcon={<Save size={16} />}
             onClick={() => {
-              const current = presets.find((item) => item.id === presetId);
-              setPresetName(current?.name ?? "");
-              setPresetDefault(current?.isDefault ?? false);
+              setPresetSaveId(null);
+              setPresetName("");
+              setPresetDefault(false);
               setPresetError("");
               setSaveOpen(true);
             }}
           >
-            {presetId ? "更新此预设" : "保存为预设"}
+            保存为新预设
+          </Button>
+          <Button
+            startIcon={<Pencil size={16} />}
+            disabled={!presetId}
+            onClick={() => {
+              const current = presets.find((item) => item.id === presetId);
+              if (!current) return;
+              setPresetSaveId(current.id);
+              setPresetName(current.name);
+              setPresetDefault(current.isDefault);
+              setPresetError("");
+              setSaveOpen(true);
+            }}
+          >
+            更新当前预设
           </Button>
           <Button
             color="error"
@@ -1659,7 +1729,7 @@ function CreatePage({ session, notify, navigate }: PageProps) {
             删除
           </Button>
           <span className="preset-hint">
-            保存常用区域、镜像、规格与登录方式，下次一键套用。
+            可保存多个预设；另存为新预设不会覆盖当前预设，仅一个可设为默认。
           </span>
         </Paper>
         {!session.writesEnabled && (
@@ -1880,13 +1950,33 @@ function CreatePage({ session, notify, navigate }: PageProps) {
                   className="span-two"
                   label="网络协议"
                   select
-                  value={String(form.ipv6)}
-                  onChange={(e) => field("ipv6", e.target.value === "true")}
-                  helperText="Standard 公网 IPv4 按时计费；IPv6 地址本身免费，流量及关联资源另计"
+                  value={networkMode}
+                  onChange={(e) => {
+                    const mode = e.target.value;
+                    setForm((old) => ({
+                      ...old,
+                      publicIpv4: mode !== "ipv6",
+                      ipv6: mode !== "ipv4",
+                    }));
+                  }}
+                  helperText={
+                    networkMode === "ipv6"
+                      ? "不创建公网 IPv4；IPv6 地址本身免费，虚拟机、磁盘和流量仍按订阅规则收费"
+                      : "Standard 公网 IPv4 按时计费；IPv6 地址本身免费，流量及关联资源另计"
+                  }
                 >
-                  <MenuItem value="false">IPv4</MenuItem>
-                  <MenuItem value="true">IPv4 + IPv6</MenuItem>
+                  <MenuItem value="ipv4">IPv4</MenuItem>
+                  <MenuItem value="dual">IPv4 + IPv6</MenuItem>
+                  <MenuItem value="ipv6">仅公网 IPv6（保留内网 IPv4）</MenuItem>
                 </TextField>
+                {networkMode === "ipv6" && (
+                  <Alert severity="warning" className="span-two">
+                    仅公网 IPv6 模式保留 Azure 所需的内网 IPv4，但不创建公网
+                    IPv4、NAT 网关或其他 IPv4 出网服务。连接端必须支持
+                    IPv6，机器无法直接访问仅支持 IPv4 的网站、软件源或
+                    API；启动脚本及软件安装可能因此失败。
+                  </Alert>
+                )}
                 <Alert severity="warning" className="span-two">
                   新建虚拟机的安全组默认对所有来源开放全部入站端口和协议，启用
                   IPv6 时也放行
@@ -1933,7 +2023,13 @@ function CreatePage({ session, notify, navigate }: PageProps) {
               </div>
               <div className="summary-row">
                 <span>公网 IP</span>
-                <b>Standard · 静态</b>
+                <b>
+                  {networkMode === "ipv6"
+                    ? "仅 IPv6 · Standard 静态"
+                    : networkMode === "dual"
+                      ? "IPv4 + IPv6 · Standard 静态"
+                      : "IPv4 · Standard 静态"}
+                </b>
               </div>
               <div className="summary-row">
                 <span>入站规则</span>
@@ -1981,7 +2077,7 @@ function CreatePage({ session, notify, navigate }: PageProps) {
         </div>
       </form>
       <Dialog open={saveOpen} onClose={() => !presetBusy && setSaveOpen(false)}>
-        <DialogTitle>保存预设配置</DialogTitle>
+        <DialogTitle>{presetSaveId ? "更新预设" : "新建预设"}</DialogTitle>
         <DialogContent>
           <Stack spacing={2} sx={{ mt: 1, minWidth: 320 }}>
             <LoadError error={presetError} />
@@ -1997,12 +2093,15 @@ function CreatePage({ session, notify, navigate }: PageProps) {
               label="默认预设"
               value={String(presetDefault)}
               onChange={(e) => setPresetDefault(e.target.value === "true")}
-              helperText="设为默认后，进入创建页会自动套用"
+              helperText="可保存多个预设；仅一个可设为默认，进入创建页时自动套用"
             >
               <MenuItem value="false">否</MenuItem>
               <MenuItem value="true">是</MenuItem>
             </TextField>
             <Alert severity="info">
+              {presetSaveId
+                ? "将更新当前选中的预设，不影响其他预设。"
+                : "将创建独立的新预设，不覆盖已选中的预设。"}
               预设会保存区域、镜像、规格、系统盘、登录方式与网络设置；不保存虚拟机名称。
               预设含密码时以加密方式存储。
             </Alert>

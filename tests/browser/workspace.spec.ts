@@ -96,25 +96,31 @@ test("login, navigation, MD3 theme, resource details, quota and mobile layout", 
     .click();
   await page.getByRole("button", { name: "加载可用规格" }).click();
   await expect(page.getByLabel("虚拟机规格")).toContainText("B1s");
-  await page.getByLabel("网络协议").click();
+  await page.getByRole("combobox", { name: "网络协议" }).click();
   await page.getByRole("option", { name: "IPv4 + IPv6", exact: true }).click();
   await page
     .getByLabel("RSA SSH 公钥")
     .fill("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ== test@example");
   // Preset configuration: save current settings and reload them later.
-  await page.getByRole("button", { name: "保存为预设" }).click();
+  await page.getByRole("button", { name: "保存为新预设" }).click();
   await page.getByLabel("预设名称").fill("测试预设");
   await page.getByRole("button", { name: "保存", exact: true }).click();
   await expect(page.getByText("预设已保存")).toBeVisible();
   const preset = page.getByRole("combobox", { name: "预设配置" });
   await expect(preset).toContainText("测试预设");
-  await page.getByLabel("网络协议").click();
+  await page.getByRole("combobox", { name: "网络协议" }).click();
+  await page
+    .getByRole("option", { name: "仅公网 IPv6（保留内网 IPv4）", exact: true })
+    .click();
+  await page.getByRole("combobox", { name: "网络协议" }).click();
   await page.getByRole("option", { name: "IPv4", exact: true }).click();
   await preset.click();
   await page.getByRole("option", { name: "不使用预设" }).click();
   await preset.click();
-  await page.getByRole("option", { name: /测试预设/ }).click();
-  await expect(page.getByLabel("网络协议")).toHaveText("IPv4 + IPv6");
+  await page.getByRole("option", { name: "测试预设", exact: true }).click();
+  await expect(page.getByRole("combobox", { name: "网络协议" })).toHaveText(
+    "IPv4 + IPv6",
+  );
   await expect(
     page.getByRole("button", { name: "创建虚拟机", exact: true }),
   ).toBeDisabled();

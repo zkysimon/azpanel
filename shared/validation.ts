@@ -43,12 +43,18 @@ export const vmSettingsSchema = z
     authentication: z.enum(["ssh", "password"]),
     sshKey: z.string().max(16384).default(""),
     password: z.string().max(123).default(""),
+    publicIpv4: z.boolean().default(true),
     ipv6: z.boolean().default(false),
     customData: z.string().max(45000).default(""),
   })
   .superRefine((value, ctx) => {
     const error = (path: string, message: string) =>
       ctx.addIssue({ code: "custom", path: [path], message });
+    if (!value.publicIpv4 && !value.ipv6)
+      error(
+        "publicIpv4",
+        "不创建公网 IPv4 时必须启用 IPv6，请选择有效的公网模式",
+      );
     if (
       value.authentication === "ssh" &&
       !/^ssh-rsa [A-Za-z0-9+/=]+(?: .*)?$/.test(value.sshKey.trim())

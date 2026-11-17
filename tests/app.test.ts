@@ -60,6 +60,7 @@ test("session, CSRF, tenant isolation, read-only gate, credential encryption, an
     assert.equal(write.statusCode, 403);
     for (const [url, payload] of [
       [`/api/machines/${machine.id}/action`, { action: "delete", force: true, confirmation: machine.name }],
+      [`/api/machines/${machine.id}/action`, { action: "delete", cleanup: true, cleanupConfirmed: true, fingerprint: "a".repeat(64), confirmation: machine.name }],
       [`/api/accounts/${account.id}/groups`, { group: "occupied", fingerprint: "a".repeat(64), confirmation: "occupied" }],
       [`/api/accounts/${account.id}/groups/delete-batch`, { groups: [{ group: "occupied", fingerprint: "a".repeat(64) }], confirmation: "DELETE" }],
     ] as const) {

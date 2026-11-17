@@ -61,7 +61,9 @@ test("creation checks availability and group collision before submitting depende
         path.includes("/providers/Microsoft.Compute?") ||
         path.includes("/providers/Microsoft.Network?")
       )
-        return Response.json(providerMetadata(new URL(path).pathname.split("/").pop()!));
+        return Response.json(
+          providerMetadata(new URL(path).pathname.split("/").pop()!),
+        );
       return Response.json({ properties: { provisioningState: "Succeeded" } });
     },
     async () => "token",
@@ -103,4 +105,33 @@ test("creation checks availability and group collision before submitting depende
       input.password,
     ),
   );
+  const start = requests.length;
+  await azure.create(
+    credentials,
+    account,
+    {
+      ...input,
+      name: "ipv6-vm",
+      confirmation: "ipv6-vm",
+      publicIpv4: false,
+      ipv6: true,
+    },
+    () => {},
+  );
+  const v6Writes = requests
+    .slice(start)
+    .filter((request) => request.method !== "GET");
+  assert.equal(v6Writes.length, 3);
+  for (const write of v6Writes.slice(1)) {
+    const ips = write.body.properties.template.resources.filter(
+      (resource: any) =>
+        resource.type === "Microsoft.Network/publicIPAddresses",
+    );
+    assert.equal(
+      ips.length,
+      1,
+      "both validation and deployment must omit public IPv4",
+    );
+    assert.equal(ips[0].properties.publicIPAddressVersion, "IPv6");
+  }
 });

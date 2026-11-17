@@ -7,6 +7,7 @@ import { account, credentials, machine, providerMetadata, testConfig } from "./f
 const aiRoot = `/subscriptions/${account.subscriptionId}/resourceGroups/ai-group/providers/Microsoft.CognitiveServices/accounts/test-ai`;
 const aiDeployments: Record<string, any> = {};
 const vmDeployments: Record<string, any> = {};
+const groupInventories: Record<string, any[]> = {};
 
 const store = new Store(testConfig, true);
 const admin = store.db.prepare("SELECT id FROM users LIMIT 1").get() as {
@@ -46,6 +47,21 @@ const azure = new Azure(
   new RequestGate(0),
   async (url, options) => {
     const path = new URL(String(url)).pathname;
+    if (path in vmDeployments && options?.method === "GET")
+      return Response.json(vmDeployments[path]);
+    if (path.endsWith("/resources")) {
+      const root = path.slice(0, -"/resources".length);
+      if (root in groupInventories)
+        return Response.json({ value: groupInventories[root] });
+    }
+    if (path in groupInventories && options?.method === "GET")
+      return Response.json({ name: path.split("/").pop(), tags: { managedBy: "azpanel" } });
+    if (path in groupInventories && options?.method === "DELETE") {
+      for (const id of Object.keys(vmDeployments))
+        if (id.startsWith(path + "/")) delete vmDeployments[id];
+      delete groupInventories[path];
+      return new Response(null, { status: 204 });
+    }
     if (path.endsWith("/virtualMachines"))
       return Response.json({ value: Object.values(vmDeployments) });
     if (path.endsWith("/instanceView"))
@@ -66,6 +82,13 @@ const azure = new Azure(
         path.split("/providers/")[0] +
         "/providers/Microsoft.Compute/virtualMachines/" +
         vm.name;
+      const root = path.split("/providers/")[0];
+      const disk = { name: `${vm.name}_OsDisk_1_mock`, type: "Microsoft.Compute/disks" };
+      const diskId = `${root}/providers/${disk.type}/${disk.name}`;
+      groupInventories[root] = [...body.properties.template.resources, disk].map((resource: any) => ({
+        id: `${root}/providers/${resource.type}/${resource.name}`,
+        name: resource.name, type: resource.type,
+      }));
       vmDeployments[id] = {
         ...vm,
         id,
@@ -75,7 +98,7 @@ const azure = new Azure(
           networkProfile: { networkInterfaces: [] },
           storageProfile: {
             ...vm.properties.storageProfile,
-            osDisk: { ...vm.properties.storageProfile.osDisk, osType: "Linux" },
+            osDisk: { ...vm.properties.storageProfile.osDisk, osType: "Linux", name: disk.name, managedDisk: { id: diskId } },
           },
         },
       };

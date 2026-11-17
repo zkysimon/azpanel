@@ -66,6 +66,11 @@ export interface GroupDeletionPreview {
   fingerprint: string;
   resources: { id: string; name: string; type: string }[];
 }
+export interface VmDeletionPreview {
+  cleanupAvailable: boolean;
+  reason?: string;
+  group?: GroupDeletionPreview;
+}
 export interface User {
   id: string;
   email: string;

@@ -718,6 +718,18 @@ export async function buildApp(
       ),
     };
   });
+  app.get("/api/machines/:id/delete-preview", async (request) => {
+    const { vm } = store.machine(
+      user(request).id,
+      idParams.parse(request.params).id,
+    );
+    const account = store.account(user(request).id, vm.accountId);
+    return azure.previewVmDeletion(
+      store.credentials(user(request).id, vm.accountId),
+      account,
+      vm,
+    );
+  });
   app.post("/api/machines/:id/action", async (request) => {
     checkWrites();
     const { vm } = store.machine(
@@ -739,25 +751,81 @@ export async function buildApp(
         size: sizeSchema.optional(),
         diskSize: z.number().int().min(30).max(4095).optional(),
         force: z.boolean().default(false),
+        cleanup: z.boolean().default(false),
+        cleanupConfirmed: z.boolean().default(false),
+        fingerprint: z
+          .string()
+          .regex(/^[a-f0-9]{64}$/)
+          .optional(),
       })
       .parse(request.body);
     confirm(input.confirmation, vm.name);
     if (input.force && input.action !== "delete")
       throw new AppError(422, "强制选项仅适用于删除虚拟机");
+    if (
+      input.cleanup &&
+      (input.action !== "delete" ||
+        !input.cleanupConfirmed ||
+        !input.fingerprint)
+    )
+      throw new AppError(
+        422,
+        "清理附属资源需要先查看完整清单并明确确认永久删除",
+      );
     if (input.action === "resize" && !input.size)
       throw new AppError(422, "请选择新规格");
     if (input.action === "disk" && !input.diskSize)
       throw new AppError(422, "请选择新系统盘容量");
     const account = store.account(user(request).id, vm.accountId),
       credentials = store.credentials(user(request).id, vm.accountId);
+    if (input.cleanup)
+      await azure.assertVmCleanupUnchanged(
+        credentials,
+        account,
+        vm,
+        input.fingerprint!,
+      );
     return {
       taskId: tasks.enqueue(
         user(request).id,
         account.id,
-        input.force ? "强制删除虚拟机" : input.action,
+        input.cleanup
+          ? "删除虚拟机及附属资源"
+          : input.force
+            ? "强制删除虚拟机"
+            : input.action,
         vm.name,
         async (progress) => {
           if (input.action === "delete") {
+            if (input.cleanup) {
+              try {
+                await azure.deleteVmAndResources(
+                  credentials,
+                  account,
+                  vm,
+                  input.fingerprint!,
+                  progress,
+                  input.force,
+                );
+              } catch (error) {
+                try {
+                  await sync(user(request).id, account, credentials, progress);
+                } catch {
+                  // Preserve the cleanup error, including possible partial deletion.
+                }
+                if (error instanceof AppError)
+                  throw new AppError(
+                    error.status,
+                    `${error.message}。清理可能未完成，请在资源浏览器检查 ${vm.resourceGroup}，不要将任务失败视为所有资源均保留。`,
+                  );
+                throw error;
+              }
+              store.removeGroupMachines(account.id, vm.resourceGroup);
+              return {
+                message:
+                  "虚拟机、磁盘、网卡、公网 IP 及已确认的独立资源组已清理",
+              };
+            }
             await azure.deleteVm(credentials, vm, progress, input.force);
             store.removeMachine(account.id, vm.id);
             try {
